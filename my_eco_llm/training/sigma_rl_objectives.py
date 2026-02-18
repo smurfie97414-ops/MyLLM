@@ -122,13 +122,14 @@ def _gspo_like_loss(
     seq_new, ratio = _compute_ratio(logp_new, logp_old, mask)
     seq_old = _masked_mean(logp_old, mask)
     kl = (seq_old - seq_new)
+    kl_mean = kl.mean()
     policy_gain = (ratio * adv.mean()).mean()
     entropy = _entropy_from_logprobs(logp_new, mask)
-    loss = -(policy_gain + (cfg.entropy_weight * entropy)) + (cfg.kl_weight * kl)
+    loss = -(policy_gain + (cfg.entropy_weight * entropy)) + (cfg.kl_weight * kl_mean)
     metrics = {
         "sigma_rl_adv_mean": float(adv.mean().item()),
         "sigma_rl_ratio": float(ratio.mean().item()),
-        "sigma_rl_kl": float(kl.item()),
+        "sigma_rl_kl": float(kl_mean.item()),
         "sigma_rl_entropy": float(entropy.item()),
     }
     return loss, metrics

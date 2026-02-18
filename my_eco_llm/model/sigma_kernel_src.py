@@ -1,7 +1,7 @@
 import triton
 import triton.language as tl
 DEFAULT_BLOCK_T = 16
-DEFAULT_BLOCK_N = 128
+DEFAULT_BLOCK_N = 64
 
 @triton.jit
 def mamba3_complex_scan_interleaved_kernel(x_ptr, out_ptr, a_ptr, b_ptr, state_ptr, n_lanes, BLOCK_T: tl.constexpr, BLOCK_N: tl.constexpr):

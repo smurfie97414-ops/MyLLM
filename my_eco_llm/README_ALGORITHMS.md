@@ -1,88 +1,227 @@
 ﻿# README_ALGORITHMS
 
-This file is the authoritative list of active algorithms and optimizations in the SIGMA stack.
+Ce document décrit l'état algorithmique réel du stack SIGMA, avec séparation claire entre:
 
-## Default-On Core Stack
-- BitLinear b1.58 projections: `model/bitlinear.py`
-- FastLanguageModel strict 1.58-bit loader path (`load_in_1_58bit=True`): `training/fastlanguage_loader.py`
-- Mamba-3 MIMO complex Triton scan: `model/sigma_llm.py`, `model/sigma_kernels.py`
-- Differential MLA attention: `model/sigma_llm.py`, `model/attention.py`
-- DeepSeekMoE + RIB routing: `model/moe.py`, `model/sigma_llm.py`
-- MoE grouped dispatch optimization + stage timing metrics: `model/moe.py`
-- INSTANT memory protocol: `training/memory_hack.py`
-- INSTANT adaptive reversible inversion (early-stop fixed-point): `training/memory_hack.py`
-- C3O optimizer: `training/optimizer_c3o.py` (selected by default)
-- C3O reduced-memory state dtype (`bf16` default in auto profile): `training/optimizer_c3o.py`, `train_sigma.py`
-- TTRL + Sigma RL objectives: `training/sigma_trainer.py`, `training/sigma_rl_objectives.py`
-- Adaptive RL Objective Mixer (auto blend of CISPO/DISPO/IGRPO/GSPO): `training/sigma_trainer.py`
-- Asymmetric verification: `training/sigma_trainer.py`
-- Verifier cascade refine gating (top-fraction refinement): `training/sigma_trainer.py`
-- Causal replay prioritization: `training/replay_causal.py`
-- Horizon-delayed causal replay credit: `training/replay_causal.py`
-- Counterfactual credit signal: `training/counterfactual_credit.py`
-- Self-improver loop: `training/sigma_self_improver.py`
-- Fractal NAS + UROBOROS: `evolution/fractal_nas.py`, `evolution/meta_loop.py`
-- Hydra-V2.1 loop (domain LoRA + DPO + rollback + merge): `training/hydra_v21.py`, `model/merger.py`
-- Hydra-V2.1 batched candidate generation + cached DPO ref logprobs: `training/hydra_v21.py`
-- Triton BitLinear static launch heuristic (OOM-safe, no autotune bench allocation): `model/triton_kernels.py`
-- Integrity guards / anti-fake checks: `training/integrity_guards.py`
-- Startup seed curriculum bootstrap (deterministic synthetic warmstart): `training/data.py`
-- GRPO bridge with executable code reward (+2/-1) for TRL: `training/grpo_trl_bridge.py`, `training/code_sandbox.py`
+- fonctionnalités structurelles du code,
+- fonctionnalités activées par défaut via `train_sigma_args.txt`,
+- fonctionnalités disponibles mais dépendantes de flags/contexte.
 
-## Important Runtime Guarantees
-- SIGMA requires CUDA runtime.
-- SIGMA requires Triton Mamba scan path.
-- INSTANT patching is mandatory and verified at trainer startup.
-- Architecture validation now enforces at least one Mamba block and one MLA block.
+## 1) Cœur modèle
 
-## Verification Signals
-Use startup log + `metrics.jsonl`:
-- startup:
-  - `algorithmic_features={...}`
-  - non-zero `mamba3_layers`, `mla_layers`, `moe_layers`, `bitlinear_layers`
-- runtime flags:
-  - `feature_instant_enabled == 1`
-  - `feature_diff_mla_enabled == 1`
-  - `feature_sigma_rl_enabled == 1`
-  - `feature_verifier_enabled == 1`
-  - `feature_fractal_nas_enabled == 1`
-  - `feature_uroboros_enabled == 1`
-  - `feature_causal_replay_enabled == 1`
-  - `feature_c3o_credit_enabled == 1`
-  - `feature_asym_verify_enabled == 1`
-  - `feature_verifier_cascade_enabled == 1`
-  - `feature_rl_auto_mix_enabled == 1`
-  - `feature_hydra_v21_enabled == 1` (when enabled in args)
-- effectiveness:
-  - each corresponding `feature_*_effective_calls > 0` on real training runs
+### 1.1 SigmaLLM (architecture principale)
 
-## Optimization Notes
-- GPU-only training compute is default because mixed GPU+CPU compute introduces synchronization and transfer overhead.
-- CPU remains relevant for data feeding and orchestration.
-- Hardware profile auto-tuning exists but default profile is set for stable CUDA-dominant throughput.
-- Model parameter dtype is auto-promoted to `bf16` when supported for memory/throughput efficiency.
+- Fichier: `model/sigma_llm.py`
+- Composition:
+  - `SigmaMambaBlock` (Mamba-3 complexe + MoE)
+  - `SigmaMLABlock` (MLA + MoE + differential attention)
+- Ratios de stack pilotés par:
+  - `--mamba-ratio`
+  - `--attention-ratio`
 
-## Optimizer Options
-- Default: `muon` (strict matrix/vector split)
-- Alternative available: `gnprox`
-- Alternative available: `c3o`
+### 1.2 BitLinear
 
-## Data Path (Storage-Constrained)
-- Streaming-first pipeline (`datasets.load_dataset(..., streaming=True)` + CommonCrawl stream path)
-- No mandatory full-dataset disk download
-- HF token can be supplied by CLI/env for higher limits
-- Default EXE profile uses HF interleave (FineWeb + Cosmopedia) for stable startup.
-- Default EXE profile uses `hybrid` streaming backend (HF + CommonCrawl) to reduce rate-limit stalls.
-- Bootstrap seed batches are enabled by default to avoid first-step stalls before remote streams are hot.
+- Fichier: `model/bitlinear.py`
+- Rôle:
+  - projections linéaires quantifiées
+  - chemin de quantification avec cache optionnel
+- Kernels associés:
+  - `model/triton_kernels.py`
+  - source Triton: `model/triton_kernel_src.py`
 
-## Checkpoint Safety
-- Resume latest valid checkpoint by default
-- Corrupted latest checkpoint is quarantined and previous valid checkpoint is resumed automatically
-- Retention cap defaults to 5
+### 1.3 MLA et MoE
 
-## Known Bottleneck Axes to Monitor
-- verifier cost (`phase_ttrl_s`, `phase_meta_s`)
-- model compute (`phase_train_s`, `core_tokens_per_s`)
-- input pipeline (`phase_data_s`)
-- bottleneck indicators (`perf_bottleneck_stage_id`, `perf_bottleneck_share`)
-- startup readiness (`time_to_first_batch_s`, `time_to_first_step_s`)
+- MLA: `model/attention.py`
+- MoE DeepSeek + routing/RIB: `model/moe.py`
+
+## 2) Kernels et exigences d'exécution
+
+### 2.1 Triton BitLinear
+
+- `model/triton_kernels.py`
+- Vérifie `TRITON_AVAILABLE` à l'import
+- Peut fallback selon contexte, mais les voies optimales exigent Triton fonctionnel
+
+### 2.2 Triton scan Mamba
+
+- `model/sigma_kernels.py`
+- `mamba3_complex_scan_interleaved` impose des contraintes runtime strictes (CUDA + disponibilité Triton)
+- Source kernel: `model/sigma_kernel_src.py`
+
+### 2.3 INSTANT obligatoire sur Sigma
+
+- `SigmaLLM` exige patch INSTANT avant `forward`
+- En cas d'absence de patch: `RuntimeError`
+- Patch appliqué côté training via `training/memory_hack.py`
+
+## 3) Pipeline d'entraînement SIGMA
+
+### 3.1 Orchestrateur
+
+- `training/sigma_trainer.py`
+- Responsabilités:
+  - loop train
+  - instrumentation/perf phase timing
+  - activation des sous-systèmes RL/verifier/évolution
+  - checkpoints atomiques + reprise
+  - crash reports détaillés
+
+### 3.2 Objectifs RL et vérification
+
+- Bridge TRL/GRPO: `training/grpo_trl_bridge.py`
+- Sandbox exécution code: `training/code_sandbox.py`
+- Objectifs RL Sigma: `training/sigma_rl_objectives.py`
+- Verifier: `training/sigma_verifier.py`
+
+### 3.3 Replay et crédit
+
+- Replay causal: `training/replay_causal.py`
+- Crédit contre-factuel: `training/counterfactual_credit.py`
+- Boucles de stabilisation adaptative dans `sigma_trainer.py`
+
+## 4) Optimisation
+
+### 4.1 Choix d'optimiseur exposés
+
+`train_sigma.py` (`--optimizer`):
+
+- `muon`
+- `normuon`
+- `adamuon`
+- `c3o`
+- `gnprox`
+
+Implémentation: `training/optimizer.py`
+
+### 4.2 Muon family
+
+- Split strict matrices/vecteurs supporté
+- Exclusions embeddings/lm_head configurables
+- Hyperparamètres orthogonalisation/TEON/adaptatifs étendus
+
+### 4.3 C3O
+
+- Implémentation dédiée: `training/optimizer_c3o.py`
+- Intégration config/build dans `training/optimizer.py`
+- Crédit C3O piloté côté trainer (`feature_c3o_credit_*`)
+
+### 4.4 GNProx
+
+- Implémentation: `training/optimizer_gn.py`
+- Source kernel: `training/optimizer_gn_kernel_src.py`
+
+## 5) Data pipeline
+
+- Implémentation: `training/data.py`
+- Backend par défaut EXE: `hybrid`
+- Sources:
+  - FineWeb/Cosmopedia (streaming HF)
+  - CommonCrawl
+- Mécanismes:
+  - prefetch
+  - fallback résilient
+  - seed/bootstrap batches au démarrage
+
+## 6) Évolution et recherche
+
+### 6.1 Fractal NAS
+
+- `evolution/fractal_nas.py`
+- Ajustements/essais orientés perf/structure
+
+### 6.2 Uroboros
+
+- `evolution/meta_loop.py`
+- Boucle de recherche/expérimentation avec fenêtres d'évaluation
+
+### 6.3 Research loop
+
+- `research/cycle_research_engine.py`
+- Support de traçabilité des cycles/hypothèses
+
+## 7) Intégrité, preuve et auditabilité
+
+- Gardes d'intégrité: `training/integrity_guards.py`
+- Manifeste hidden-eval: `training/hidden_eval_manifest.json`
+- Dans `sigma_trainer.py`, les compteurs `feature_*_effective_calls` matérialisent l'activation réelle des features.
+
+## 8) Features activées par défaut dans le profil EXE (`train_sigma_args.txt`)
+
+Profil actuel notable:
+
+- `--optimizer c3o`
+- `--grpo-backend trl`
+- `--data-backend hybrid`
+- `--no-torch-compile`
+- verifier math/code activé
+- `--verifier-cascade-enabled`
+- `--causal-replay-enabled`
+- `--c3o-credit-enabled`
+- `--self-improver-enabled`
+- `--uroboros-enabled`
+- `--hydra-enable`
+- `--integrity-guards-enabled`
+- `--crash-report-enabled`
+
+Important: la vérité runtime est le fichier d'arguments, pas uniquement les defaults de `parse_args()`.
+
+Compatibilite stricte:
+
+- si `--c3o-credit-enabled` est actif, l'optimiseur doit etre `c3o` (sinon hard fail startup).
+
+## 9) Signaux observables recommandés
+
+Vérifier dans `metrics.jsonl`:
+
+- `feature_*_enabled`
+- `feature_*_effective_calls`
+- timings phase (`phase_*`)
+- débit (`core_tokens_per_s`, `effective_tokens_per_s`)
+- goulot (`perf_bottleneck_*`)
+
+Vérifier aussi:
+
+- checkpoints valides créés/réutilisés
+- absence d'erreurs dans `<output_dir>/errors/`
+
+## 10) Limites et points de vigilance
+
+- Certaines voies critiques dépendent strictement de CUDA + Triton
+- Le mode EXE peut diverger des defaults Python si `train_sigma_args.txt` force des options
+- Toute affirmation algorithmique doit être validée par compteur effectif et non par simple présence de code
+
+## 11) Preuves runtime EXE (mesurees)
+
+### 11.1 Preuve standard (`runs/proof_exe_standard50_c3o`)
+
+- `unsloth_trl_patch_active=1` avec `hits=6/targets=6`
+- `feature_instant_effective_calls=50`
+- `feature_diff_mla_effective_calls=50`
+- `feature_sigma_rl_effective_calls=2`
+- `feature_verifier_effective_calls=40`
+- `feature_verifier_cascade_effective_calls=2`
+- `feature_fractal_nas_effective_calls=1`
+- `feature_self_improver_effective_calls=32`
+- `feature_uroboros_effective_calls=50`
+- `feature_causal_replay_effective_calls=50`
+- `feature_c3o_credit_effective_calls=54`
+- `feature_asym_verify_effective_calls=2`
+- `feature_rl_auto_mix_effective_calls=4`
+- `feature_hydra_v21_effective_calls=3`
+
+### 11.2 Preuve d'activation acceleree (`runs/proof_exe_activation_c3o`)
+
+- `feature_sigma_rl_effective_calls=3`
+- `feature_verifier_effective_calls=60`
+- `feature_verifier_cascade_effective_calls=3`
+- `feature_asym_verify_effective_calls=3`
+- `feature_rl_auto_mix_effective_calls=4`
+- `feature_hydra_v21_effective_calls=1`
+- `feature_fractal_nas_effective_calls=2`
+- `feature_c3o_credit_effective_calls=11`
+
+### 11.3 Correctifs structurels realises
+
+- `training/code_sandbox.py`: warmup explicite de l'executor pour eviter les faux echec reward au premier appel.
+- `training/sigma_rl_objectives.py`: correction GSPO (`sigma_rl_kl`) en scalaire (`mean`) pour eviter crash tensor->scalar.
+- `train_sigma.py`: bootstrap Unsloth/compile cache en package importable et activation `TRITON_BACKENDS_IN_TREE=1`.
+- `build_exe.bat`: packaging source-first de `triton` + metadonnees/dependances critiques (`wandb`, `tokenizers`, etc.).

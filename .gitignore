@@ -1,11 +1,16 @@
 libtorch/
+unsloth_compiled_cache/
 my_eco_llm/_internal/
 my_eco_llm/checkpoints/
+my_eco_llm/checkpoints_*/
 my_eco_llm/dist/
 my_eco_llm/runs/
 my_eco_llm/.runtime_cache/
 my_eco_llm/.triton_cache/
 my_eco_llm/unsloth_compiled_cache/
+my_eco_llm/.pip_tmp*/
+my_eco_llm/.tmp_*/
+my_eco_llm/.req_probe.txt
 my_eco_llm/*.exe
 **/__pycache__/
 *.pyc

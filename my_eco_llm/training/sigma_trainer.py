@@ -138,6 +138,7 @@ class SigmaTrainConfig:
     # Integrity / anti-fake
     integrity_guards_enabled: bool = True
     proof_mode: bool = False
+    strict_feature_usage: bool = True
     integrity_hidden_eval_manifest: str = ""
     integrity_hidden_eval_every: int = 2
 
@@ -202,6 +203,13 @@ class SigmaTrainConfig:
     merge_method: str = "ties"
     merge_density: float = 1.0
     merge_fold_into_backbone: bool = False
+    unsloth_bootstrap_imported: bool = False
+    unsloth_preloaded_trl: bool = False
+    unsloth_preloaded_transformers: bool = False
+    unsloth_preloaded_peft: bool = False
+    unsloth_trl_patch_active: bool = False
+    unsloth_trl_patch_hits: int = 0
+    unsloth_trl_patch_targets: int = 0
 
 
 class SigmaTrainer:
@@ -745,7 +753,7 @@ class SigmaTrainer:
 
     def _optim_step(self, loss: torch.Tensor) -> tuple[float, dict[str, float]]:
         t0 = time.perf_counter()
-        if hasattr(self.optimizer, "set_credit_signal"):
+        if bool(self.config.c3o_credit_enabled) and hasattr(self.optimizer, "set_credit_signal"):
             try:
                 self.optimizer.set_credit_signal(float(self.credit_estimator.current_signal()))
                 self.feature_calls["feature_c3o_credit"] += 1
@@ -1446,6 +1454,13 @@ class SigmaTrainer:
             "feature_asym_verify_effective_calls": float(self.feature_calls["feature_asym_verify"]),
             "feature_rl_auto_mix_effective_calls": float(self.feature_calls["feature_rl_auto_mix"]),
             "feature_hydra_v21_effective_calls": float(self.feature_calls["feature_hydra_v21"]),
+            "unsloth_bootstrap_imported": 1.0 if self.config.unsloth_bootstrap_imported else 0.0,
+            "unsloth_preloaded_trl": 1.0 if self.config.unsloth_preloaded_trl else 0.0,
+            "unsloth_preloaded_transformers": 1.0 if self.config.unsloth_preloaded_transformers else 0.0,
+            "unsloth_preloaded_peft": 1.0 if self.config.unsloth_preloaded_peft else 0.0,
+            "unsloth_trl_patch_active": 1.0 if self.config.unsloth_trl_patch_active else 0.0,
+            "unsloth_trl_patch_hits": float(self.config.unsloth_trl_patch_hits),
+            "unsloth_trl_patch_targets": float(self.config.unsloth_trl_patch_targets),
         }
 
     def _perf_window_bounds(self) -> tuple[int, int]:
@@ -1923,7 +1938,8 @@ class SigmaTrainer:
                         replay_used=bool(self._last_replay_injected),
                     )
                     phase_causal_s = max(time.perf_counter() - t_phase, 0.0)
-                    self.feature_calls["feature_causal_replay"] += 1
+                    if bool(self.config.causal_replay_enabled):
+                        self.feature_calls["feature_causal_replay"] += 1
                     for k, v in causal_metrics.items():
                         metrics[k] = float(v)
                     t_phase = time.perf_counter()
@@ -2076,15 +2092,28 @@ class SigmaTrainer:
             required_calls = dict(self.feature_calls)
             if self.global_step < max(1, int(self.config.fractal_interval_steps)):
                 required_calls.pop("feature_fractal_nas", None)
+            if self.global_step < max(1, int(self.config.uroboros_interval)):
+                required_calls.pop("feature_uroboros", None)
             if not self.config.self_improver_enabled:
+                required_calls.pop("feature_self_improver", None)
+            elif self.global_step < max(1, int(self.config.self_improver_interval)):
                 required_calls.pop("feature_self_improver", None)
             if not self.config.uroboros_enabled:
                 required_calls.pop("feature_uroboros", None)
             if not self.config.causal_replay_enabled:
                 required_calls.pop("feature_causal_replay", None)
+            ttrl_interval = max(1, int(self._effective_ttrl_interval()))
+            if self.global_step < ttrl_interval:
+                required_calls.pop("feature_sigma_rl", None)
+                required_calls.pop("feature_verifier", None)
+                required_calls.pop("feature_verifier_cascade", None)
+                required_calls.pop("feature_asym_verify", None)
+                required_calls.pop("feature_rl_auto_mix", None)
             if not self.config.ttrl_asym_verify_enabled:
                 required_calls.pop("feature_asym_verify", None)
             if not self.config.hydra_enable:
+                required_calls.pop("feature_hydra_v21", None)
+            elif self.global_step < max(1, int(self.config.hydra_update_interval)):
                 required_calls.pop("feature_hydra_v21", None)
             if not self.config.verifier_cascade_enabled:
                 required_calls.pop("feature_verifier_cascade", None)
@@ -2101,6 +2130,7 @@ class SigmaTrainer:
                 required_calls.pop("feature_rl_auto_mix", None)
             check_feature_effective_calls(
                 proof_mode=bool(self.config.proof_mode),
+                strict_mode=bool(self.config.strict_feature_usage),
                 feature_calls=required_calls,
             )
         finally:

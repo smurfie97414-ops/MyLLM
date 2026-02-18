@@ -70,13 +70,12 @@ def ensure_proof_inputs(cfg: IntegrityConfig) -> None:
 def check_feature_effective_calls(
     *,
     proof_mode: bool,
+    strict_mode: bool = False,
     feature_calls: dict[str, int],
 ) -> None:
-    if not proof_mode:
+    if not (proof_mode or strict_mode):
         return
     missing = [k for k, v in feature_calls.items() if int(v) <= 0]
     if missing:
-        raise RuntimeError(
-            "Proof run invalid: claimed features had zero effective calls: " + ", ".join(sorted(missing))
-        )
-
+        label = "Proof run invalid" if proof_mode else "Strict runtime validation failed"
+        raise RuntimeError(f"{label}: claimed features had zero effective calls: " + ", ".join(sorted(missing)))

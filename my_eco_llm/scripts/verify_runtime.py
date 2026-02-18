@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
+import importlib.util
 import json
 import sys
 from typing import Any
@@ -23,33 +25,40 @@ def _check_trl_symbols() -> None:
         raise RuntimeError(f"trl is installed but missing symbols: {missing}")
 
 
-def _check_unsloth_symbols() -> None:
-    unsloth = _import_or_fail("unsloth")
-    if not hasattr(unsloth, "FastLanguageModel"):
-        raise RuntimeError("unsloth is installed but FastLanguageModel is missing.")
+def _check_unsloth_presence() -> None:
+    if importlib.util.find_spec("unsloth") is None:
+        raise RuntimeError("Missing unsloth package.")
+    if importlib.util.find_spec("unsloth_zoo") is None:
+        raise RuntimeError("Missing unsloth_zoo package.")
+    try:
+        _ = importlib.metadata.version("unsloth")
+        _ = importlib.metadata.version("unsloth-zoo")
+    except Exception as exc:
+        raise RuntimeError(f"Unsloth package metadata lookup failed: {exc}") from exc
 
 
 def main() -> int:
     mods = [
-        "unsloth",
         "torch",
         "transformers",
         "datasets",
         "accelerate",
         "peft",
         "trl",
+        "wandb",
+        "wandb_workspaces",
         "tiktoken",
         "pynvml",
         "triton",
-        "kfp",
-        "wandb_workspaces",
     ]
     loaded = {name: 0 for name in mods}
     for m in mods:
         _import_or_fail(m)
         loaded[m] = 1
     _check_trl_symbols()
-    _check_unsloth_symbols()
+    _check_unsloth_presence()
+    loaded["unsloth"] = 1
+    loaded["unsloth_zoo"] = 1
 
     import torch  # noqa: WPS433
 

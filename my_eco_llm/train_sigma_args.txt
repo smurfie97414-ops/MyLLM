@@ -3,12 +3,7 @@
 cuda
 --require-cuda
 --optimizer
-muon
---muon-strict-split
---muon-exclude-embeddings
---muon-exclude-lm-head
---muon-max-orthogonalized-dim
-8192
+c3o
 --quant-mode
 bitnet_1_58
 --moe-gate-precision

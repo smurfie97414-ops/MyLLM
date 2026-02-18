@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -8,15 +9,32 @@ import random
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+
+_UNSLOTH_COMPILE_DIR = Path.cwd() / "unsloth_compiled_cache"
+_UNSLOTH_COMPILE_DIR.mkdir(parents=True, exist_ok=True)
+_UNSLOTH_COMPILE_INIT = _UNSLOTH_COMPILE_DIR / "__init__.py"
+if not _UNSLOTH_COMPILE_INIT.exists():
+    _UNSLOTH_COMPILE_INIT.write_text("", encoding="utf-8")
+_CWD_STR = str(Path.cwd())
+if _CWD_STR not in sys.path:
+    sys.path.insert(0, _CWD_STR)
+os.environ.setdefault("TRITON_BACKENDS_IN_TREE", "1")
+os.environ.setdefault("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
+_UNSLOTH_CRITICAL_MODULES = ("trl", "transformers", "peft")
+_UNSLOTH_PRELOADED_CRITICAL = {name: int(name in sys.modules) for name in _UNSLOTH_CRITICAL_MODULES}
+_UNSLOTH_IMPORT_ERROR = ""
+try:
+    import unsloth  # type: ignore  # noqa: F401
+
+    _UNSLOTH_IMPORTED = True
+except Exception as exc:
+    _UNSLOTH_IMPORTED = False
+    _UNSLOTH_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 import numpy as np
 import torch
-
-from model.sigma_llm import SigmaConfig, SigmaLLM
-from training.data import StreamingDataConfig, build_streaming_dataloader, build_tokenizer
-from training.optimizer import OptimizerConfig, build_optimizer
-from training.sigma_trainer import SigmaTrainConfig, SigmaTrainer
 
 
 class _ArgsFileParser(argparse.ArgumentParser):
@@ -142,10 +160,22 @@ def _configure_runtime_caches(output_dir: str) -> None:
     cache_root = Path.cwd() / ".runtime_cache"
     triton_cache = cache_root / "triton"
     inductor_cache = cache_root / "inductor"
+    runtime_tmp = cache_root / "tmp"
+    unsloth_compile_cache = Path.cwd() / "unsloth_compiled_cache"
     triton_cache.mkdir(parents=True, exist_ok=True)
     inductor_cache.mkdir(parents=True, exist_ok=True)
+    runtime_tmp.mkdir(parents=True, exist_ok=True)
+    unsloth_compile_cache.mkdir(parents=True, exist_ok=True)
+    unsloth_init = unsloth_compile_cache / "__init__.py"
+    if not unsloth_init.exists():
+        unsloth_init.write_text("", encoding="utf-8")
     os.environ.setdefault("TRITON_CACHE_DIR", str(triton_cache))
     os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(inductor_cache))
+    os.environ.setdefault("TMP", str(runtime_tmp))
+    os.environ.setdefault("TEMP", str(runtime_tmp))
+    os.environ.setdefault("TMPDIR", str(runtime_tmp))
+    os.environ.setdefault("WANDB_DISABLED", "true")
+    os.environ["UNSLOTH_COMPILE_LOCATION"] = "unsloth_compiled_cache"
     # PyInstaller EXE runtime lacks some inductor C++ wrapper headers; force Python wrapper path.
     os.environ.setdefault("TORCHINDUCTOR_CPP_WRAPPER", "0")
     os.environ.setdefault("TORCHINDUCTOR_DISABLE_CPP_CODEGEN", "1")
@@ -153,6 +183,137 @@ def _configure_runtime_caches(output_dir: str) -> None:
     if output_dir:
         run_cache = Path(output_dir) / "cache"
         run_cache.mkdir(parents=True, exist_ok=True)
+
+
+def _require_module(name: str, required_symbols: tuple[str, ...] = ()) -> None:
+    try:
+        mod = importlib.import_module(name)
+    except Exception as exc:
+        raise RuntimeError(f"Missing or broken dependency '{name}': {exc}") from exc
+    for symbol in required_symbols:
+        if not hasattr(mod, symbol):
+            raise RuntimeError(f"Dependency '{name}' is installed but missing required symbol '{symbol}'.")
+
+
+def _audit_enabled_dependencies(args: argparse.Namespace) -> None:
+    if not bool(args.strict_runtime_audit):
+        return
+
+    _require_module("torch")
+    _require_module("numpy")
+    _require_module("psutil")
+    _require_module("pynvml")
+    _require_module("triton")
+
+    if str(args.tokenizer_backend).strip().lower() == "tiktoken":
+        _require_module("tiktoken")
+        _require_module("tiktoken_ext.openai_public")
+    else:
+        _require_module("transformers")
+
+    if str(args.data_backend).strip().lower() in {"hf", "hybrid"}:
+        _require_module("datasets")
+
+    if str(args.grpo_backend).strip().lower() == "trl":
+        _require_module("transformers")
+        _require_module("accelerate")
+        _require_module("peft")
+        _require_module("trl", required_symbols=("GRPOConfig", "GRPOTrainer"))
+        _require_module("wandb")
+        _require_module("wandb_workspaces")
+
+    if str(args.optimizer).strip().lower() == "gnprox" and not torch.cuda.is_available():
+        raise RuntimeError("GNProx optimizer requires CUDA.")
+
+    if bool(args.c3o_credit_enabled) and str(args.optimizer).strip().lower() != "c3o":
+        raise RuntimeError(
+            "c3o credit is enabled but optimizer is not 'c3o'. "
+            "Use --optimizer c3o or disable --c3o-credit-enabled."
+        )
+
+    if str(args.quant_mode).strip().lower() == "bitnet_1_58":
+        _require_module("unsloth", required_symbols=("FastLanguageModel",))
+        _require_module("unsloth_zoo")
+        if not _UNSLOTH_IMPORTED:
+            raise RuntimeError(f"unsloth import bootstrap failed before trainer initialization: {_UNSLOTH_IMPORT_ERROR}")
+        preloaded = [name for name, flag in _UNSLOTH_PRELOADED_CRITICAL.items() if int(flag) == 1]
+        if preloaded:
+            raise RuntimeError(
+                "unsloth was imported after critical modules already loaded: "
+                + ", ".join(preloaded)
+                + ". This disables real unsloth patching."
+            )
+
+
+def _detect_unsloth_trl_patch_state() -> dict[str, int]:
+    state = {
+        "unsloth_trl_patch_targets": 0,
+        "unsloth_trl_patch_hits": 0,
+        "unsloth_trl_patch_active": 0,
+    }
+    if not _UNSLOTH_IMPORTED:
+        return state
+    try:
+        trl = importlib.import_module("trl")
+    except Exception:
+        return state
+
+    probe_classes = (
+        "GRPOTrainer",
+        "PPOTrainer",
+        "SFTTrainer",
+        "DPOTrainer",
+        "ORPOTrainer",
+        "RewardTrainer",
+    )
+    for name in probe_classes:
+        cls = getattr(trl, name, None)
+        if cls is None:
+            continue
+        state["unsloth_trl_patch_targets"] += 1
+        cls_name = str(getattr(cls, "__name__", ""))
+        if cls_name.startswith("Unsloth"):
+            state["unsloth_trl_patch_hits"] += 1
+    state["unsloth_trl_patch_active"] = int(state["unsloth_trl_patch_hits"] > 0)
+    return state
+
+
+def _validate_strict_feature_schedule(args: argparse.Namespace) -> None:
+    if not bool(args.strict_feature_usage):
+        return
+
+    steps = max(1, int(args.steps))
+    required_steps: dict[str, int] = {}
+
+    ttrl_interval = max(1, int(args.ttrl_interval))
+    ramp_steps = max(0, int(args.startup_meta_ramp_steps))
+    ramp_mult = max(1, int(args.startup_ttrl_interval_multiplier))
+    ttrl_effective = ttrl_interval if (ramp_steps <= 0 or steps > ramp_steps) else (ttrl_interval * ramp_mult)
+
+    if bool(args.verifier_math_enabled or args.verifier_code_enabled):
+        required_steps["ttrl/verifier/sigma_rl"] = ttrl_effective
+    if bool(args.ttrl_asym_verify_enabled):
+        required_steps["ttrl_asym_verify"] = ttrl_effective
+    if bool(args.sigma_rl_auto_mix_enabled):
+        required_steps["sigma_rl_auto_mix"] = ttrl_effective
+    if bool(args.verifier_cascade_enabled):
+        required_steps["verifier_cascade"] = ttrl_effective
+    if bool(args.fractal_interval_steps > 0):
+        required_steps["fractal_nas"] = max(1, int(args.fractal_interval_steps))
+    if bool(args.uroboros_enabled):
+        required_steps["uroboros"] = max(1, int(args.uroboros_interval))
+    if bool(args.hydra_enable):
+        required_steps["hydra_v21"] = max(1, int(args.hydra_update_interval))
+    if bool(args.self_improver_enabled):
+        required_steps["self_improver"] = max(1, int(args.self_improver_interval))
+
+    missing = {name: need for name, need in required_steps.items() if steps < need}
+    if missing:
+        details = ", ".join(f"{k}:>={v}" for k, v in sorted(missing.items()))
+        raise RuntimeError(
+            "Strict feature validation is enabled, but --steps is too small to trigger all enabled features. "
+            f"Current steps={steps}. Required: {details}. Increase --steps or disable corresponding features."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -343,6 +504,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--self-improver-sigma-max", type=float, default=0.30)
     p.add_argument("--integrity-guards-enabled", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--proof-mode", action="store_true")
+    p.add_argument("--strict-runtime-audit", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--strict-feature-usage", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--require-unsloth-trl-patch", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--integrity-hidden-eval-manifest", type=str, default="")
     p.add_argument("--integrity-hidden-eval-every", type=int, default=2)
     p.add_argument("--metrics-ema-beta", type=float, default=0.90)
@@ -408,6 +572,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    from model.sigma_llm import SigmaConfig, SigmaLLM
+    from training.data import StreamingDataConfig, build_streaming_dataloader, build_tokenizer
+    from training.optimizer import OptimizerConfig, build_optimizer
+    from training.sigma_trainer import SigmaTrainConfig, SigmaTrainer
+
     _configure_runtime_caches(args.output_dir)
     os.environ.setdefault("TORCH_NVCC_FLAGS", "--allow-unsupported-compiler")
     os.environ.setdefault("CUDAFLAGS", "--allow-unsupported-compiler")
@@ -418,6 +587,8 @@ def main() -> None:
         raise RuntimeError("SIGMA training requires CUDA but CUDA is unavailable.")
     if not args.device.startswith("cuda"):
         raise RuntimeError("SIGMA training requires --device cuda.")
+    _audit_enabled_dependencies(args)
+    _validate_strict_feature_schedule(args)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -469,12 +640,14 @@ def main() -> None:
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         data_config=data_cfg,
-        force_synthetic=args.synthetic_data,
+        force_synthetic=bool(args.synthetic_data),
         num_workers=workers,
         pin_memory=True,
-        persistent_workers=args.persistent_workers,
+        persistent_workers=bool(args.persistent_workers),
         prefetch_factor=prefetch,
     )
+    probe_iter = iter(dataloader)
+    del probe_iter
 
     sigma_cfg = SigmaConfig(
         vocab_size=tokenizer.vocab_size,
@@ -538,6 +711,15 @@ def main() -> None:
         f"backend={args.grpo_backend} num_generations={int(args.grpo_num_generations)} "
         f"reward_success={float(args.grpo_reward_success):.3f} reward_fail={float(args.grpo_reward_fail):.3f}"
     )
+    print(
+        "[sigma] unsloth_bootstrap "
+        f"imported={int(_UNSLOTH_IMPORTED)} "
+        f"preloaded_trl={int(_UNSLOTH_PRELOADED_CRITICAL.get('trl', 0))} "
+        f"preloaded_transformers={int(_UNSLOTH_PRELOADED_CRITICAL.get('transformers', 0))} "
+        f"preloaded_peft={int(_UNSLOTH_PRELOADED_CRITICAL.get('peft', 0))}"
+    )
+    if _UNSLOTH_IMPORT_ERROR:
+        print(f"[sigma] unsloth_bootstrap_error={_UNSLOTH_IMPORT_ERROR}")
     trl_grpo_available = 0
     trl_grpo_error = ""
     try:
@@ -569,6 +751,22 @@ def main() -> None:
             if not _probe or float(_probe[0]) != float(args.grpo_reward_success):
                 raise RuntimeError("TRL GRPO bridge self-check failed: sandbox reward mismatch.")
         print("[sigma] trl_grpo_bridge_ready=1")
+    unsloth_patch_state = _detect_unsloth_trl_patch_state()
+    print(
+        "[sigma] unsloth_trl_patch "
+        f"active={int(unsloth_patch_state['unsloth_trl_patch_active'])} "
+        f"hits={int(unsloth_patch_state['unsloth_trl_patch_hits'])} "
+        f"targets={int(unsloth_patch_state['unsloth_trl_patch_targets'])}"
+    )
+    if (
+        str(args.grpo_backend).strip().lower() == "trl"
+        and bool(args.require_unsloth_trl_patch)
+        and int(unsloth_patch_state["unsloth_trl_patch_active"]) == 0
+    ):
+        raise RuntimeError(
+            "unsloth TRL patch is required but not active. "
+            "Fix packaging/import order so TRL trainers are actually patched by unsloth."
+        )
 
     optim_cfg = OptimizerConfig(
         optimizer_name=args.optimizer,
@@ -683,6 +881,7 @@ def main() -> None:
         self_improver_sigma_max=args.self_improver_sigma_max,
         integrity_guards_enabled=args.integrity_guards_enabled,
         proof_mode=args.proof_mode,
+        strict_feature_usage=args.strict_feature_usage,
         integrity_hidden_eval_manifest=args.integrity_hidden_eval_manifest,
         integrity_hidden_eval_every=args.integrity_hidden_eval_every,
         metrics_ema_beta=args.metrics_ema_beta,
@@ -739,6 +938,13 @@ def main() -> None:
         merge_method=args.merge_method,
         merge_density=args.merge_density,
         merge_fold_into_backbone=args.merge_fold_into_backbone,
+        unsloth_bootstrap_imported=bool(_UNSLOTH_IMPORTED),
+        unsloth_preloaded_trl=bool(_UNSLOTH_PRELOADED_CRITICAL.get("trl", 0)),
+        unsloth_preloaded_transformers=bool(_UNSLOTH_PRELOADED_CRITICAL.get("transformers", 0)),
+        unsloth_preloaded_peft=bool(_UNSLOTH_PRELOADED_CRITICAL.get("peft", 0)),
+        unsloth_trl_patch_active=bool(unsloth_patch_state["unsloth_trl_patch_active"]),
+        unsloth_trl_patch_hits=int(unsloth_patch_state["unsloth_trl_patch_hits"]),
+        unsloth_trl_patch_targets=int(unsloth_patch_state["unsloth_trl_patch_targets"]),
     )
     trainer = SigmaTrainer(
         model=model,
