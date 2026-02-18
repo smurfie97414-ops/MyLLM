@@ -1,0 +1,10 @@
+libtorch/
+my_eco_llm/_internal/
+my_eco_llm/checkpoints/
+my_eco_llm/dist/
+my_eco_llm/runs/
+my_eco_llm/.runtime_cache/
+my_eco_llm/.triton_cache/
+my_eco_llm/unsloth_compiled_cache/
+my_eco_llm/__pycache__/
+my_eco_llm/*.exe

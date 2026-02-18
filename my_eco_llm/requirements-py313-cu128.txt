@@ -1,0 +1,26 @@
+# Core runtime
+numpy==2.4.2
+nvidia-ml-py==13.590.48
+psutil==7.2.2
+
+# Model/training stack
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.10.0+cu128
+triton-windows==3.6.0.post25
+transformers==4.57.6
+datasets==4.3.0
+accelerate==1.12.0
+tiktoken==0.12.0
+peft==0.18.0
+trl==0.24.0
+wandb==0.24.0
+kfp==2.15.2
+wandb-workspaces==0.3.4
+
+# FastLanguageModel stack (1.58-bit loader path)
+unsloth==2026.2.1
+unsloth-zoo==2026.2.1
+
+# Packaging
+pyinstaller==6.16.0

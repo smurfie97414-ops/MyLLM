@@ -1,0 +1,26 @@
+[
+  {
+    "task_id": "math_hidden_1",
+    "domain": "math",
+    "prompt": "Solve and return only one integer at the end.\nProblem: 734 * 29\nAnswer:",
+    "expected": "21286"
+  },
+  {
+    "task_id": "math_hidden_2",
+    "domain": "math",
+    "prompt": "Solve and return only one integer at the end.\nProblem: 910 - 377\nAnswer:",
+    "expected": "533"
+  },
+  {
+    "task_id": "code_hidden_1",
+    "domain": "code",
+    "prompt": "Read this Python snippet and return only the final integer value of out.\n```python\nx = 17\ny = 23\nz = 11\nout = ((x * y) + z) % (x + 3)\nprint(out)\n```\nAnswer:",
+    "expected": "2"
+  },
+  {
+    "task_id": "code_hidden_2",
+    "domain": "code",
+    "prompt": "Read this Python snippet and return only the final integer value of out.\n```python\nx = 9\ny = 14\nz = 5\nout = ((x * y) + z) % (x + 3)\nprint(out)\n```\nAnswer:",
+    "expected": "11"
+  }
+]
