@@ -173,6 +173,8 @@ class SigmaTrainConfig:
     first_batch_timeout_sec: float = 240.0
     startup_meta_ramp_steps: int = 64
     startup_ttrl_interval_multiplier: int = 4
+    startup_meta_real_data_buffer_steps: int = 8
+    bootstrap_seed_batches: int = 64
     perf_profile_enable: bool = False
     perf_warmup_steps: int = 20
     perf_measure_steps: int = 200
@@ -396,6 +398,10 @@ class SigmaTrainer:
         self._base_lrs: list[float] = []
         self._lr_factor = 1.0
         self._adaptive_ttrl_interval = max(1, int(config.ttrl_interval))
+        self._meta_activation_step = max(
+            0,
+            int(config.bootstrap_seed_batches) + max(0, int(config.startup_meta_real_data_buffer_steps)),
+        )
         self._ttrl_budget = min(max(1, int(config.ttrl_budget_min)), max(1, int(config.ttrl_budget_max)))
         self._replay_bias = 1.0
         self._last_ttrl_reward = 0.0
@@ -436,6 +442,7 @@ class SigmaTrainer:
             "instant_patched_mamba": float(patch_stats["patched_mamba"]),
             "instant_patched_mla": float(patch_stats["patched_mla"]),
             "instant_reversible_rel_error": float(rev_err),
+            "meta_activation_step": float(self._meta_activation_step),
         }
 
         kernel_src = Path(__file__).resolve().parents[1] / "model" / "sigma_kernel_src.py"
@@ -717,6 +724,9 @@ class SigmaTrainer:
             return base
         mult = max(1, int(self.config.startup_ttrl_interval_multiplier))
         return max(1, base * mult)
+
+    def _meta_features_ready(self) -> bool:
+        return bool(self.global_step > int(self._meta_activation_step))
 
     def _prepare_batch(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
@@ -1454,6 +1464,8 @@ class SigmaTrainer:
             "feature_asym_verify_effective_calls": float(self.feature_calls["feature_asym_verify"]),
             "feature_rl_auto_mix_effective_calls": float(self.feature_calls["feature_rl_auto_mix"]),
             "feature_hydra_v21_effective_calls": float(self.feature_calls["feature_hydra_v21"]),
+            "meta_activation_step": float(self._meta_activation_step),
+            "meta_features_ready": 1.0 if self._meta_features_ready() else 0.0,
             "unsloth_bootstrap_imported": 1.0 if self.config.unsloth_bootstrap_imported else 0.0,
             "unsloth_preloaded_trl": 1.0 if self.config.unsloth_preloaded_trl else 0.0,
             "unsloth_preloaded_transformers": 1.0 if self.config.unsloth_preloaded_transformers else 0.0,
@@ -1884,14 +1896,14 @@ class SigmaTrainer:
                     for k, v in instant_metrics.items():
                         metrics[k] = float(v)
 
-                    if (self.global_step % self._effective_ttrl_interval()) == 0:
+                    if self._meta_features_ready() and (self.global_step % self._effective_ttrl_interval()) == 0:
                         t_phase = time.perf_counter()
                         ttrl_metrics = self._run_ttrl()
                         phase_ttrl_s = max(time.perf_counter() - t_phase, 0.0)
                         for k, v in ttrl_metrics.items():
                             metrics[k] = float(v)
 
-                    if self.hydra_engine is not None:
+                    if self.hydra_engine is not None and self._meta_features_ready():
                         t_phase = time.perf_counter()
                         hydra_metrics = self.hydra_engine.step(self.global_step)
                         phase_hydra_s = max(time.perf_counter() - t_phase, 0.0)
@@ -1900,34 +1912,43 @@ class SigmaTrainer:
                         for k, v in hydra_metrics.items():
                             metrics[k] = float(v)
 
-                    t_phase = time.perf_counter()
-                    se_metrics = self._self_evolve_step(
-                        loss_val=loss_val,
-                        tokens_per_s=tokens_per_s,
-                        gpu_mem_reserved_gb=float(metrics.get("gpu_mem_reserved_gb", 0.0)),
-                    )
-                    phase_self_evolve_s = max(time.perf_counter() - t_phase, 0.0)
+                    phase_self_evolve_s = 0.0
+                    se_metrics: dict[str, float] = {}
+                    if self._meta_features_ready():
+                        t_phase = time.perf_counter()
+                        se_metrics = self._self_evolve_step(
+                            loss_val=loss_val,
+                            tokens_per_s=tokens_per_s,
+                            gpu_mem_reserved_gb=float(metrics.get("gpu_mem_reserved_gb", 0.0)),
+                        )
+                        phase_self_evolve_s = max(time.perf_counter() - t_phase, 0.0)
                     for k, v in se_metrics.items():
                         metrics[k] = float(v)
 
-                    t_phase = time.perf_counter()
-                    fractal_metrics = self.fractal.step(
-                        step_idx=self.global_step,
-                        model=self.model,
-                        tokens_per_s=tokens_per_s,
-                        loss_value=loss_val,
-                        gpu_mem_reserved_gb=float(metrics.get("gpu_mem_reserved_gb", 0.0)),
-                        instant_reconstruction_error=float(metrics.get("instant_reconstruction_error", 0.0)),
-                    )
-                    phase_fractal_s = max(time.perf_counter() - t_phase, 0.0)
+                    phase_fractal_s = 0.0
+                    fractal_metrics: dict[str, float] = {}
+                    if self._meta_features_ready():
+                        t_phase = time.perf_counter()
+                        fractal_metrics = self.fractal.step(
+                            step_idx=self.global_step,
+                            model=self.model,
+                            tokens_per_s=tokens_per_s,
+                            loss_value=loss_val,
+                            gpu_mem_reserved_gb=float(metrics.get("gpu_mem_reserved_gb", 0.0)),
+                            instant_reconstruction_error=float(metrics.get("instant_reconstruction_error", 0.0)),
+                        )
+                        phase_fractal_s = max(time.perf_counter() - t_phase, 0.0)
                     if fractal_metrics:
                         self.feature_calls["feature_fractal_nas"] += 1
                     for k, v in fractal_metrics.items():
                         metrics[k] = float(v)
 
-                    t_phase = time.perf_counter()
-                    uroboros_metrics = self._uroboros_step(metrics)
-                    phase_uroboros_s = max(time.perf_counter() - t_phase, 0.0)
+                    phase_uroboros_s = 0.0
+                    uroboros_metrics: dict[str, float] = {}
+                    if self._meta_features_ready():
+                        t_phase = time.perf_counter()
+                        uroboros_metrics = self._uroboros_step(metrics)
+                        phase_uroboros_s = max(time.perf_counter() - t_phase, 0.0)
                     for k, v in uroboros_metrics.items():
                         metrics[k] = float(v)
 
@@ -1961,6 +1982,8 @@ class SigmaTrainer:
                     metrics["forward_research_loop_enabled"] = float(int(self.config.forward_research_loop_enabled))
                     metrics["checkpoint_resume_step"] = float(self._checkpoint_resume_step)
                     metrics["checkpoint_quarantine_count"] = float(self._checkpoint_quarantine_count)
+                    metrics["meta_activation_step"] = float(self._meta_activation_step)
+                    metrics["meta_features_ready"] = 1.0 if self._meta_features_ready() else 0.0
                     phase_metrics_s = max(time.perf_counter() - t_phase, 0.0)
 
                     total_step_time = max(time.perf_counter() - start, 1e-6)
@@ -2090,20 +2113,30 @@ class SigmaTrainer:
                 self._save_checkpoint(self.global_step)
 
             required_calls = dict(self.feature_calls)
-            if self.global_step < max(1, int(self.config.fractal_interval_steps)):
+            if self.global_step <= int(self._meta_activation_step):
+                required_calls.pop("feature_sigma_rl", None)
+                required_calls.pop("feature_verifier", None)
+                required_calls.pop("feature_verifier_cascade", None)
+                required_calls.pop("feature_asym_verify", None)
+                required_calls.pop("feature_rl_auto_mix", None)
                 required_calls.pop("feature_fractal_nas", None)
-            if self.global_step < max(1, int(self.config.uroboros_interval)):
+                required_calls.pop("feature_self_improver", None)
+                required_calls.pop("feature_uroboros", None)
+                required_calls.pop("feature_hydra_v21", None)
+            if self.global_step < (int(self._meta_activation_step) + max(1, int(self.config.fractal_interval_steps))):
+                required_calls.pop("feature_fractal_nas", None)
+            if self.global_step < (int(self._meta_activation_step) + max(1, int(self.config.uroboros_interval))):
                 required_calls.pop("feature_uroboros", None)
             if not self.config.self_improver_enabled:
                 required_calls.pop("feature_self_improver", None)
-            elif self.global_step < max(1, int(self.config.self_improver_interval)):
+            elif self.global_step < (int(self._meta_activation_step) + max(1, int(self.config.self_improver_interval))):
                 required_calls.pop("feature_self_improver", None)
             if not self.config.uroboros_enabled:
                 required_calls.pop("feature_uroboros", None)
             if not self.config.causal_replay_enabled:
                 required_calls.pop("feature_causal_replay", None)
             ttrl_interval = max(1, int(self._effective_ttrl_interval()))
-            if self.global_step < ttrl_interval:
+            if self.global_step < (int(self._meta_activation_step) + ttrl_interval):
                 required_calls.pop("feature_sigma_rl", None)
                 required_calls.pop("feature_verifier", None)
                 required_calls.pop("feature_verifier_cascade", None)
@@ -2113,7 +2146,7 @@ class SigmaTrainer:
                 required_calls.pop("feature_asym_verify", None)
             if not self.config.hydra_enable:
                 required_calls.pop("feature_hydra_v21", None)
-            elif self.global_step < max(1, int(self.config.hydra_update_interval)):
+            elif self.global_step < (int(self._meta_activation_step) + max(1, int(self.config.hydra_update_interval))):
                 required_calls.pop("feature_hydra_v21", None)
             if not self.config.verifier_cascade_enabled:
                 required_calls.pop("feature_verifier_cascade", None)

@@ -13,6 +13,7 @@ if not errorlevel 1 (
 set "PYTHON=py -3.13"
 if exist "C:\Python313\python.exe" set "PYTHON=C:\Python313\python.exe"
 set "REQ_FILE=requirements-py313-cu128.txt"
+set "HOOKS_DIR=%cd%\hooks"
 set "VSDEVCMD=C:\Program Files\Microsoft Visual Studio\18\Insiders\Common7\Tools\VsDevCmd.bat"
 set "VCVARS64=C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvars64.bat"
 
@@ -65,6 +66,12 @@ if errorlevel 1 goto :fail
 echo [build] Verifying runtime imports and required symbols...
 %PYTHON% scripts\verify_runtime.py
 if errorlevel 1 goto :fail
+echo [build] Applying third-party packaging patches...
+%PYTHON% scripts\patch_third_party_for_packaging.py
+if errorlevel 1 goto :fail
+for /f "usebackq delims=" %%I in (`%PYTHON% -c "import torch; print((torch.version.cuda or '').replace('.', ''))"`) do set "PYI_BNB_CUDA_TAG=%%I"
+if "%PYI_BNB_CUDA_TAG%"=="" set "PYI_BNB_CUDA_TAG=128"
+echo [build] bitsandbytes target CUDA tag: %PYI_BNB_CUDA_TAG%
 
 for /f "usebackq delims=" %%I in (`%PYTHON% -c "import pathlib,sysconfig; print(pathlib.Path(sysconfig.get_paths()['include']))"`) do set "PY_INCLUDE_DIR=%%I"
 for /f "usebackq delims=" %%I in (`%PYTHON% -c "import pathlib,sys; print(pathlib.Path(sys.base_exec_prefix) / 'libs')"`) do set "PY_LIB_DIR=%%I"
@@ -74,6 +81,9 @@ for /f "usebackq delims=" %%I in (`%PYTHON% -c "import accelerate,pathlib; print
 for /f "usebackq delims=" %%I in (`%PYTHON% -c "import peft,pathlib; print(pathlib.Path(peft.__file__).resolve().parent)"`) do set "PEFT_PKG_DIR=%%I"
 for /f "usebackq delims=" %%I in (`%PYTHON% -c "import trl,pathlib; print(pathlib.Path(trl.__file__).resolve().parent)"`) do set "TRL_PKG_DIR=%%I"
 for /f "usebackq delims=" %%I in (`%PYTHON% -c "import triton,pathlib; print(pathlib.Path(triton.__file__).resolve().parent)"`) do set "TRITON_PKG_DIR=%%I"
+for /f "usebackq delims=" %%I in (`%PYTHON% -c "import torchao,pathlib; print(pathlib.Path(torchao.__file__).resolve().parent)"`) do set "TORCHAO_PKG_DIR=%%I"
+for /f "usebackq delims=" %%I in (`%PYTHON% -c "import wandb,pathlib; print(pathlib.Path(wandb.__file__).resolve().parent)"`) do set "WANDB_PKG_DIR=%%I"
+for /f "usebackq delims=" %%I in (`%PYTHON% -c "import wandb_workspaces,pathlib; print(pathlib.Path(wandb_workspaces.__file__).resolve().parent)"`) do set "WANDB_WORKSPACES_PKG_DIR=%%I"
 set "TORCH_INCLUDE_DIR=%TORCH_PKG_DIR%\include"
 set "TORCH_LIB_DIR=%TORCH_PKG_DIR%\lib"
 echo [build] Python include dir: %PY_INCLUDE_DIR%
@@ -84,6 +94,9 @@ echo [build] Accelerate package dir: %ACCELERATE_PKG_DIR%
 echo [build] PEFT package dir: %PEFT_PKG_DIR%
 echo [build] TRL package dir: %TRL_PKG_DIR%
 echo [build] Triton package dir: %TRITON_PKG_DIR%
+echo [build] TorchAO package dir: %TORCHAO_PKG_DIR%
+echo [build] wandb package dir: %WANDB_PKG_DIR%
+echo [build] wandb_workspaces package dir: %WANDB_WORKSPACES_PKG_DIR%
 echo [build] Torch include dir: %TORCH_INCLUDE_DIR%
 echo [build] Torch lib dir: %TORCH_LIB_DIR%
 
@@ -113,11 +126,16 @@ echo [build] Building eco_train.exe ...
   --onedir ^
   --console ^
   --name eco_train ^
+  --additional-hooks-dir "%HOOKS_DIR%" ^
   --exclude-module transformers ^
   --exclude-module accelerate ^
   --exclude-module peft ^
   --exclude-module trl ^
   --exclude-module triton ^
+  --exclude-module torchao ^
+  --exclude-module wandb ^
+  --exclude-module wandb_workspaces ^
+  --exclude-module pyglet ^
   --paths . ^
   --add-data "model\triton_kernel_src.py;model" ^
   --add-data "model\sigma_kernel_src.py;model" ^
@@ -133,11 +151,15 @@ echo [build] Building eco_train.exe ...
   --add-data "%PEFT_PKG_DIR%;peft" ^
   --add-data "%TRL_PKG_DIR%;trl" ^
   --add-data "%TRITON_PKG_DIR%;triton" ^
+  --add-data "%TORCHAO_PKG_DIR%;torchao" ^
+  --add-data "%WANDB_PKG_DIR%;wandb" ^
+  --add-data "%WANDB_WORKSPACES_PKG_DIR%;wandb_workspaces" ^
   --collect-data tiktoken ^
   --copy-metadata transformers ^
   --copy-metadata accelerate ^
   --copy-metadata peft ^
   --copy-metadata trl ^
+  --copy-metadata torchao ^
   --copy-metadata wandb ^
   --copy-metadata wandb-workspaces ^
   --copy-metadata regex ^
@@ -150,30 +172,30 @@ echo [build] Building eco_train.exe ...
   --copy-metadata filelock ^
   --copy-metadata numpy ^
   --copy-metadata pyyaml ^
+  --copy-metadata datasets ^
   --collect-data unsloth ^
+  --collect-data unsloth_zoo ^
+  --collect-data google.protobuf ^
   --collect-all tokenizers ^
-  --collect-all wandb ^
-  --collect-all wandb_workspaces ^
+  --collect-all xformers ^
   --copy-metadata unsloth ^
   --copy-metadata unsloth_zoo ^
+  --copy-metadata protobuf ^
   --copy-metadata xformers ^
   --copy-metadata bitsandbytes ^
   --collect-submodules model ^
   --collect-submodules training ^
   --collect-submodules evolution ^
   --collect-submodules datasets ^
+  --collect-submodules google.protobuf ^
   --collect-submodules unsloth ^
-  --collect-submodules unsloth_zoo ^
   --collect-submodules tiktoken ^
   --collect-submodules tiktoken_ext ^
   --collect-all unsloth ^
-  --collect-all unsloth_zoo ^
   --hidden-import torch ^
   --hidden-import torch.cuda ^
   --hidden-import filecmp ^
   --hidden-import tokenizers ^
-  --hidden-import wandb ^
-  --hidden-import wandb_workspaces ^
   --hidden-import unsloth ^
   --hidden-import unsloth_zoo ^
   --hidden-import tiktoken_ext.openai_public ^

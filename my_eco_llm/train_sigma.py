@@ -245,6 +245,24 @@ def _audit_enabled_dependencies(args: argparse.Namespace) -> None:
             )
 
 
+def _resolve_startup_meta_real_data_buffer_steps(args: argparse.Namespace) -> int:
+    configured = int(getattr(args, "startup_meta_real_data_buffer_steps", -1))
+    if configured >= 0:
+        return configured
+    # Auto mode: wait at least one baseline TTRL interval after bootstrap.
+    return max(1, int(getattr(args, "ttrl_interval", 1)))
+
+
+def _resolve_meta_activation_step(args: argparse.Namespace) -> int:
+    bootstrap_batches = max(0, int(getattr(args, "bootstrap_seed_batches", 0)))
+    real_data_buffer = max(0, _resolve_startup_meta_real_data_buffer_steps(args))
+    return max(0, bootstrap_batches + real_data_buffer)
+
+
+def _normalize_startup_schedule(args: argparse.Namespace) -> None:
+    args.startup_meta_real_data_buffer_steps = _resolve_startup_meta_real_data_buffer_steps(args)
+
+
 def _detect_unsloth_trl_patch_state() -> dict[str, int]:
     state = {
         "unsloth_trl_patch_targets": 0,
@@ -284,6 +302,7 @@ def _validate_strict_feature_schedule(args: argparse.Namespace) -> None:
 
     steps = max(1, int(args.steps))
     required_steps: dict[str, int] = {}
+    meta_activation_step = _resolve_meta_activation_step(args)
 
     ttrl_interval = max(1, int(args.ttrl_interval))
     ramp_steps = max(0, int(args.startup_meta_ramp_steps))
@@ -291,21 +310,21 @@ def _validate_strict_feature_schedule(args: argparse.Namespace) -> None:
     ttrl_effective = ttrl_interval if (ramp_steps <= 0 or steps > ramp_steps) else (ttrl_interval * ramp_mult)
 
     if bool(args.verifier_math_enabled or args.verifier_code_enabled):
-        required_steps["ttrl/verifier/sigma_rl"] = ttrl_effective
+        required_steps["ttrl/verifier/sigma_rl"] = meta_activation_step + ttrl_effective
     if bool(args.ttrl_asym_verify_enabled):
-        required_steps["ttrl_asym_verify"] = ttrl_effective
+        required_steps["ttrl_asym_verify"] = meta_activation_step + ttrl_effective
     if bool(args.sigma_rl_auto_mix_enabled):
-        required_steps["sigma_rl_auto_mix"] = ttrl_effective
+        required_steps["sigma_rl_auto_mix"] = meta_activation_step + ttrl_effective
     if bool(args.verifier_cascade_enabled):
-        required_steps["verifier_cascade"] = ttrl_effective
+        required_steps["verifier_cascade"] = meta_activation_step + ttrl_effective
     if bool(args.fractal_interval_steps > 0):
-        required_steps["fractal_nas"] = max(1, int(args.fractal_interval_steps))
+        required_steps["fractal_nas"] = meta_activation_step + max(1, int(args.fractal_interval_steps))
     if bool(args.uroboros_enabled):
-        required_steps["uroboros"] = max(1, int(args.uroboros_interval))
+        required_steps["uroboros"] = meta_activation_step + max(1, int(args.uroboros_interval))
     if bool(args.hydra_enable):
-        required_steps["hydra_v21"] = max(1, int(args.hydra_update_interval))
+        required_steps["hydra_v21"] = meta_activation_step + max(1, int(args.hydra_update_interval))
     if bool(args.self_improver_enabled):
-        required_steps["self_improver"] = max(1, int(args.self_improver_interval))
+        required_steps["self_improver"] = meta_activation_step + max(1, int(args.self_improver_interval))
 
     missing = {name: need for name, need in required_steps.items() if steps < need}
     if missing:
@@ -389,7 +408,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--instant-error-threshold", type=float, default=0.01)
     p.add_argument("--instant-reversible-iters", type=int, default=8)
 
-    p.add_argument("--optimizer", choices=["muon", "normuon", "adamuon", "c3o", "gnprox"], default="muon")
+    p.add_argument("--optimizer", choices=["muon", "normuon", "adamuon", "c3o", "gnprox"], default="c3o")
     p.add_argument("--muon-strict-split", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--muon-exclude-embeddings", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--muon-exclude-lm-head", action=argparse.BooleanOptionalAction, default=True)
@@ -514,6 +533,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--first-batch-timeout-sec", type=float, default=240.0)
     p.add_argument("--startup-meta-ramp-steps", type=int, default=64)
     p.add_argument("--startup-ttrl-interval-multiplier", type=int, default=4)
+    p.add_argument("--startup-meta-real-data-buffer-steps", type=int, default=-1)
     p.add_argument("--perf-profile-enable", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--perf-warmup-steps", type=int, default=20)
     p.add_argument("--perf-measure-steps", type=int, default=200)
@@ -578,11 +598,19 @@ def main() -> None:
     from training.sigma_trainer import SigmaTrainConfig, SigmaTrainer
 
     _configure_runtime_caches(args.output_dir)
+    _normalize_startup_schedule(args)
     os.environ.setdefault("TORCH_NVCC_FLAGS", "--allow-unsupported-compiler")
     os.environ.setdefault("CUDAFLAGS", "--allow-unsupported-compiler")
     os.environ.setdefault("CMAKE_CUDA_FLAGS", "--allow-unsupported-compiler")
     toolchain_ready = _bootstrap_vs2026_toolchain_env()
     print(f"[sigma] vs2026_toolchain_ready={int(bool(toolchain_ready))}")
+    meta_activation_step = _resolve_meta_activation_step(args)
+    print(
+        "[sigma] meta_schedule "
+        f"bootstrap_seed_batches={int(args.bootstrap_seed_batches)} "
+        f"real_data_buffer_steps={int(args.startup_meta_real_data_buffer_steps)} "
+        f"meta_activation_step={int(meta_activation_step)}"
+    )
     if args.require_cuda and not torch.cuda.is_available():
         raise RuntimeError("SIGMA training requires CUDA but CUDA is unavailable.")
     if not args.device.startswith("cuda"):
@@ -889,6 +917,8 @@ def main() -> None:
         first_batch_timeout_sec=args.first_batch_timeout_sec,
         startup_meta_ramp_steps=args.startup_meta_ramp_steps,
         startup_ttrl_interval_multiplier=args.startup_ttrl_interval_multiplier,
+        startup_meta_real_data_buffer_steps=args.startup_meta_real_data_buffer_steps,
+        bootstrap_seed_batches=args.bootstrap_seed_batches,
         perf_profile_enable=args.perf_profile_enable,
         perf_warmup_steps=args.perf_warmup_steps,
         perf_measure_steps=args.perf_measure_steps,

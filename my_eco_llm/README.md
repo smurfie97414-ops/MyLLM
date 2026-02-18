@@ -62,8 +62,8 @@ eco_train.exe @train_sigma_args.txt --steps 500 --output-dir runs\sigma_debug
 - `transformers==4.57.6`
 - `datasets==4.3.0`
 - `trl==0.24.0`
-- `unsloth==2025.3.3`
-- `unsloth-zoo==2025.3.1`
+- `unsloth==2026.2.1`
+- `unsloth-zoo==2026.2.1`
 
 Le build échoue volontairement si les imports/symboles requis ne sont pas présents (`scripts/verify_runtime.py`).
 
@@ -182,6 +182,10 @@ Familles de métriques:
 - `training/integrity_guards.py` fournit les checks d'empreinte/manifeste
 - `training/hidden_eval_manifest.json` sert de référence d'évaluation cachée
 - En mode preuve, les features attendues doivent produire des appels effectifs non nuls
+- L'activation des features méta est alignée sur la fin du bootstrap synthétique:
+  - `meta_activation_step = bootstrap_seed_batches + startup_meta_real_data_buffer_steps`
+  - Valeur effective par défaut du profil EXE: `64 + 8 = 72`
+  - Objectif: éviter d'optimiser la boucle RL/NAS/uroboros sur les batches bootstrap synthétiques
 
 ## 11) Risques et modes d'échec à connaître
 
@@ -222,37 +226,38 @@ Validation effectuee sur `eco_train.exe` sans fallback de desactivation (`num-wo
 Commande:
 
 ```bat
-eco_train.exe @train_sigma_args.txt --steps 50 --output-dir runs/proof_exe_standard50_c3o --checkpoint-dir checkpoints_proof_exe_standard50_c3o --save-interval 10 --log-interval 1
+eco_train.exe @train_sigma_args.txt --steps 130 --output-dir runs/proof_meta_schedule_130 --checkpoint-dir checkpoints/proof_meta_schedule_130 --save-interval 65 --log-interval 10 --no-resume
 ```
 
 Constats observes:
 
-- `runs/proof_exe_standard50_c3o/metrics.jsonl` genere (`rows=51`, dernier `step=50`)
-- `checkpoints_proof_exe_standard50_c3o/checkpoint_step_00000050.pt` genere
-- `unsloth_trl_patch_active=1`, `unsloth_trl_patch_hits=6`, `unsloth_trl_patch_targets=6`
-- Compteurs effectifs non nuls: `instant`, `diff_mla`, `sigma_rl`, `verifier`, `verifier_cascade`, `fractal_nas`, `self_improver`, `uroboros`, `causal_replay`, `asym_verify`, `rl_auto_mix`, `hydra_v21`, `c3o_credit`
+- `runs/proof_meta_schedule_130/metrics.jsonl` genere (`rows=131`, dernier `step=130`)
+- `checkpoints/proof_meta_schedule_130/checkpoint_step_00000130.pt` genere
+- Meta schedule effectif: `meta_activation_step=72`
+- Premier step observe par feature meta:
+  - `feature_self_improver_effective_calls` > 0 au step `74`
+  - `feature_uroboros_effective_calls` > 0 au step `73`
+  - `feature_sigma_rl_effective_calls` > 0 au step `78`
+  - `feature_verifier_effective_calls` > 0 au step `78`
+  - `feature_hydra_v21_effective_calls` > 0 au step `80`
+  - `feature_fractal_nas_effective_calls` > 0 au step `100`
+- Valeurs finales observees au step `130`:
+  - `feature_sigma_rl_effective_calls=7`
+  - `feature_verifier_effective_calls=137`
+  - `feature_fractal_nas_effective_calls=31`
+  - `feature_uroboros_effective_calls=58`
+  - `feature_self_improver_effective_calls=43`
+  - `feature_hydra_v21_effective_calls=4`
 
-### Run B: profil EXE d'activation acceleree (sans desactiver de features)
+### Projection de cadence (profil EXE `--steps 20000`)
 
-Commande:
+- `feature_sigma_rl`: `~2491` activations minimales
+- `feature_fractal_nas`: `~399` activations minimales
+- `feature_uroboros`: `~1993` activations minimales
+- `feature_self_improver`: `~9964` activations minimales
+- `feature_hydra_v21`: `~1246` activations minimales
 
-```bat
-eco_train.exe @train_sigma_args.txt --steps 12 --output-dir runs/proof_exe_activation_c3o --checkpoint-dir checkpoints_proof_exe_activation_c3o --save-interval 6 --log-interval 1 --startup-meta-ramp-steps 0 --ttrl-interval 2 --fractal-interval-steps 6 --hydra-update-interval 4 --uroboros-interval 4
-```
-
-Constats observes:
-
-- `runs/proof_exe_activation_c3o/metrics.jsonl` genere (`rows=8`, dernier `step=7`)
-- `checkpoints_proof_exe_activation_c3o/checkpoint_step_00000006.pt` genere
-- Compteurs effectifs non nuls supplementaires:
-  - `feature_sigma_rl_effective_calls=3`
-  - `feature_verifier_effective_calls=60`
-  - `feature_verifier_cascade_effective_calls=3`
-  - `feature_asym_verify_effective_calls=3`
-  - `feature_rl_auto_mix_effective_calls=4`
-  - `feature_hydra_v21_effective_calls=1`
-  - `feature_fractal_nas_effective_calls=2`
-  - `feature_c3o_credit_effective_calls=11`
+Ces volumes confirment que les features ne sont pas "peu utilisees" sur un run normal long, tout en evitant l'activation pendant le bootstrap synthétique.
 
 ### Note C3O
 
