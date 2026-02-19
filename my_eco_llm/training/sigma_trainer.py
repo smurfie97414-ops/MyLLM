@@ -400,6 +400,7 @@ class SigmaTrainer:
             "feature_rl_auto_mix": 0,
             "feature_hydra_v21": 0,
         }
+        self._feature_first_active_logged: set[str] = set()
 
         self.data_iter = iter(self.dataloader)
         self.global_step = 0
@@ -754,8 +755,35 @@ class SigmaTrainer:
         mult = max(1, int(self.config.startup_ttrl_interval_multiplier))
         return max(1, base * mult)
 
+    def _mark_feature_call(self, feature_name: str) -> None:
+        prev_calls = int(self.feature_calls.get(feature_name, 0))
+        next_calls = prev_calls + 1
+        self.feature_calls[feature_name] = next_calls
+        if prev_calls == 0 and next_calls > 0 and feature_name not in self._feature_first_active_logged:
+            print(f"[sigma-trainer] {feature_name} first active at step {self.global_step}")
+            self._feature_first_active_logged.add(feature_name)
+
     def _meta_features_ready(self) -> bool:
         return bool(self.global_step > int(self._meta_activation_step))
+
+    def _expected_first_meta_step(self, interval: int) -> int:
+        return int(self._meta_activation_step) + max(1, int(interval))
+
+    def _log_meta_activation_schedule(self) -> None:
+        ttrl_interval = self._effective_ttrl_interval()
+        expected_steps = {
+            "RL": self._expected_first_meta_step(ttrl_interval),
+            "Hydra": self._expected_first_meta_step(max(1, int(self.config.hydra_update_interval))),
+            "Fractal": self._expected_first_meta_step(max(1, int(self.config.fractal_interval_steps))),
+            "Uroboros": self._expected_first_meta_step(max(1, int(self.config.uroboros_interval))),
+            "Self-Improver": self._expected_first_meta_step(max(1, int(self.config.self_improver_interval))),
+        }
+        expected_str = ", ".join(f"{name}={step}" for name, step in expected_steps.items())
+        print(
+            "[sigma-trainer] meta schedule "
+            f"meta_activation_step={self._meta_activation_step} "
+            f"expected_first_eligible_steps({expected_str})"
+        )
 
     def _prepare_batch(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
@@ -795,7 +823,7 @@ class SigmaTrainer:
         if bool(self.config.c3o_credit_enabled) and hasattr(self.optimizer, "set_credit_signal"):
             try:
                 self.optimizer.set_credit_signal(float(self.credit_estimator.current_signal()))
-                self.feature_calls["feature_c3o_credit"] += 1
+                self._mark_feature_call("feature_c3o_credit")
             except Exception as exc:
                 raise RuntimeError(f"failed to set C3O credit signal: {exc}") from exc
         self.optimizer.zero_grad(set_to_none=True)
@@ -856,7 +884,7 @@ class SigmaTrainer:
             quality_score=float(novelty_quality),
         )
         self.replay.append((float(priority), seq.detach().cpu()))
-        self.feature_calls["feature_causal_replay"] += 1
+        self._mark_feature_call("feature_causal_replay")
 
     def _inject_replay(self, input_ids: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         self._last_replay_injected = False
@@ -899,13 +927,13 @@ class SigmaTrainer:
         if bool(self.config.verifier_cascade_enabled):
             parsed = parse_int_answer(text)
             if not parsed:
-                self.feature_calls["feature_verifier"] += 1
+                self._mark_feature_call("feature_verifier")
                 return 0.0, False
             if parsed == task.expected:
-                self.feature_calls["feature_verifier"] += 1
+                self._mark_feature_call("feature_verifier")
                 return 1.0, True
         result = verify_answer(task, text)
-        self.feature_calls["feature_verifier"] += 1
+        self._mark_feature_call("feature_verifier")
         return float(result.score), bool(result.passed)
 
     def _should_refine_candidate(self, *, rank_idx: int, shortlist_len: int) -> bool:
@@ -1014,7 +1042,7 @@ class SigmaTrainer:
                 cfg=self.rl_cfg,
             )
 
-        self.feature_calls["feature_rl_auto_mix"] += 1
+        self._mark_feature_call("feature_rl_auto_mix")
         mix = self._compute_rl_mix_weights(rewards=rewards, diversity=diversity)
         losses: dict[str, torch.Tensor] = {}
         metrics: dict[str, float] = {}
@@ -1066,7 +1094,7 @@ class SigmaTrainer:
             )
             text = self._safe_decode(out[0].tolist())
             vr = verify_answer(task, text)
-            self.feature_calls["feature_verifier"] += 1
+            self._mark_feature_call("feature_verifier")
             passed += int(vr.passed)
         return float(passed / max(len(picked), 1))
 
@@ -1105,7 +1133,7 @@ class SigmaTrainer:
         refined_candidates = 0
         if asym_enabled:
             if bool(self.config.verifier_cascade_enabled):
-                self.feature_calls["feature_verifier_cascade"] += 1
+                self._mark_feature_call("feature_verifier_cascade")
             pool_mult = max(1.0, float(self.config.ttrl_candidate_pool_multiplier))
             pool_size = max(group_size, int(round(group_size * pool_mult)))
             draft_candidates: list[torch.Tensor] = []
@@ -1157,7 +1185,7 @@ class SigmaTrainer:
             rewards = [float(score) for _, score in chosen]
             asym_pool = float(pool_size)
             asym_verified = float(len(shortlisted))
-            self.feature_calls["feature_asym_verify"] += 1
+            self._mark_feature_call("feature_asym_verify")
         else:
             for _ in range(group_size):
                 seq, score = self._generate_one_with_refinement(prompt_tensor=prompt_tensor, task=task)
@@ -1220,7 +1248,7 @@ class SigmaTrainer:
             rl_loss_val, _ = self._optim_step(rl_loss)
             running_loss += float(rl_loss_val)
         rl_loss_val = running_loss / max(update_repeats, 1)
-        self.feature_calls["feature_sigma_rl"] += 1
+        self._mark_feature_call("feature_sigma_rl")
 
         reward_mean = float(raw_rewards_t.mean().item())
         reward_conf = float((raw_rewards_t > 0.5).float().mean().item())
@@ -1278,7 +1306,7 @@ class SigmaTrainer:
     def _apply_policy(self, policy: dict[str, float]) -> None:
         if not policy:
             return
-        self.feature_calls["feature_self_improver"] += 1
+        self._mark_feature_call("feature_self_improver")
         self._last_policy = dict(policy)
         lr_mul = float(policy.get("policy_lr_mul", 1.0))
         new_factor = self._lr_factor * lr_mul
@@ -1324,7 +1352,7 @@ class SigmaTrainer:
             apply_runtime=self._apply_runtime_snapshot,
         )
         if out:
-            self.feature_calls["feature_uroboros"] += 1
+            self._mark_feature_call("feature_uroboros")
         rw_metrics = self.reward_weights.to_metrics()
         for k, v in rw_metrics.items():
             out[k] = float(v)
@@ -1861,6 +1889,7 @@ class SigmaTrainer:
     def train(self) -> None:
         self._maybe_compile_model()
         torch.cuda.reset_peak_memory_stats(self.device)
+        self._log_meta_activation_schedule()
         self._log_metrics(
             {
                 "step": 0.0,
@@ -1906,8 +1935,8 @@ class SigmaTrainer:
                     phase_opt_s = max(time.perf_counter() - t_train_opt, 0.0)
                     phase_train_s = max(time.perf_counter() - t_phase, 0.0)
 
-                    self.feature_calls["feature_instant"] += 1
-                    self.feature_calls["feature_diff_mla"] += 1
+                    self._mark_feature_call("feature_instant")
+                    self._mark_feature_call("feature_diff_mla")
 
                     core_step_time = max(time.perf_counter() - start, 1e-6)
                     tokens_per_s = float(input_ids.numel() / core_step_time)
@@ -1957,7 +1986,7 @@ class SigmaTrainer:
                         hydra_metrics = self.hydra_engine.step(self.global_step)
                         phase_hydra_s = max(time.perf_counter() - t_phase, 0.0)
                         if hydra_metrics:
-                            self.feature_calls["feature_hydra_v21"] += 1
+                            self._mark_feature_call("feature_hydra_v21")
                         for k, v in hydra_metrics.items():
                             metrics[k] = float(v)
 
@@ -1988,7 +2017,7 @@ class SigmaTrainer:
                         )
                         phase_fractal_s = max(time.perf_counter() - t_phase, 0.0)
                     if fractal_metrics:
-                        self.feature_calls["feature_fractal_nas"] += 1
+                        self._mark_feature_call("feature_fractal_nas")
                     for k, v in fractal_metrics.items():
                         metrics[k] = float(v)
 
@@ -2009,7 +2038,7 @@ class SigmaTrainer:
                     )
                     phase_causal_s = max(time.perf_counter() - t_phase, 0.0)
                     if bool(self.config.causal_replay_enabled):
-                        self.feature_calls["feature_causal_replay"] += 1
+                        self._mark_feature_call("feature_causal_replay")
                     for k, v in causal_metrics.items():
                         metrics[k] = float(v)
                     t_phase = time.perf_counter()
