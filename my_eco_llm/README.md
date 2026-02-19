@@ -280,4 +280,9 @@ Ces volumes confirment que les features ne sont pas "peu utilisees" sur un run n
 - Commande: `eco_train.exe @train_sigma_args.txt`
 - Observation en 10 min: progression reelle jusqu'au `step=39` dans `runs/sigma_main/metrics.jsonl`, avec `feature_c3o_credit_enabled=1` et `feature_c3o_credit_effective_calls=39`.
 
+## 15) Where files are written
+
+Les chemins relatifs (`--output-dir`, `--checkpoint-dir`, `metrics_file`) sont résolus depuis le dossier de lancement (`Path.cwd()`), pas depuis l'emplacement de l'exécutable.
+
+Exemple concret: si `eco_train.exe` est dans `D:\Sigma\bin` mais que vous lancez la commande depuis `D:\runs\exp42` avec `--checkpoint-dir checkpoints`, alors les checkpoints seront écrits dans `D:\runs\exp42\checkpoints`.
 
