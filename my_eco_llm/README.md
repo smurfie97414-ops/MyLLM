@@ -43,6 +43,20 @@ eco_train.exe @train_sigma_args.txt
 eco_train.exe @train_sigma_args.txt --steps 500 --output-dir runs\sigma_debug
 ```
 
+### Fast debug mode
+
+Utiliser un profil court et conservateur pour un run de validation rapide:
+
+```bat
+eco_train.exe @train_sigma_fastdebug_args.txt
+```
+
+Checklist d'artefacts attendus:
+
+- `runs/sigma_fastdebug/metrics.jsonl` est créé et les métriques avancent pas à pas (logs serrés via `--log-interval 1`)
+- Des checkpoints sont écrits fréquemment dans `checkpoints/fastdebug/` (toutes les 5 steps)
+- Les compteurs de features (`feature_*_effective_calls`) se comportent de façon cohérente sur un run court (ils peuvent rester faibles si la phase de bootstrap/ramp n'est pas dépassée)
+
 ## 4) Contraintes environnement strictes
 
 ### OS / Toolchain
@@ -269,6 +283,5 @@ Ces volumes confirment que les features ne sont pas "peu utilisees" sur un run n
 
 - Commande: `eco_train.exe @train_sigma_args.txt`
 - Observation en 10 min: progression reelle jusqu'au `step=39` dans `runs/sigma_main/metrics.jsonl`, avec `feature_c3o_credit_enabled=1` et `feature_c3o_credit_effective_calls=39`.
-
 
 
