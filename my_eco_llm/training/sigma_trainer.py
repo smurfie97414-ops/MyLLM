@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import random
+import sys
 import threading
 import time
 import traceback
@@ -237,16 +238,28 @@ class SigmaTrainer:
         self.device = torch.device(config.device)
         self.rng = random.Random(20260216)
 
-        self.output_dir = Path(config.output_dir)
+        self.output_dir = Path(config.output_dir).expanduser().resolve(strict=False)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.metrics_path = self.output_dir / config.metrics_file
+        self.metrics_path = (self.output_dir / config.metrics_file).resolve(strict=False)
         perf_dir_name = config.perf_report_dir.strip() if config.perf_report_dir else ""
         self.perf_dir = Path(perf_dir_name) if perf_dir_name else (self.output_dir / "perf")
         self.perf_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_dir = Path(config.checkpoint_dir)
-        if not self.checkpoint_dir.is_absolute():
-            self.checkpoint_dir = Path.cwd() / self.checkpoint_dir
+        checkpoint_path = Path(config.checkpoint_dir).expanduser()
+        checkpoint_is_relative = not checkpoint_path.is_absolute()
+        if checkpoint_is_relative:
+            executable_dir = Path(sys.argv[0]).expanduser().resolve(strict=False).parent
+            current_dir = Path.cwd().resolve(strict=False)
+            if current_dir != executable_dir:
+                print(
+                    "[startup-warning] checkpoint_dir is relative and resolves from current working directory "
+                    f"({current_dir}) instead of executable directory ({executable_dir})."
+                )
+            checkpoint_path = current_dir / checkpoint_path
+        self.checkpoint_dir = checkpoint_path.resolve(strict=False)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[startup-paths] output_dir={self.output_dir}")
+        print(f"[startup-paths] checkpoint_dir={self.checkpoint_dir}")
+        print(f"[startup-paths] metrics_file={self.metrics_path}")
 
         self.model.to(self.device)
         self.model.train()
@@ -387,6 +400,7 @@ class SigmaTrainer:
             "feature_rl_auto_mix": 0,
             "feature_hydra_v21": 0,
         }
+        self._feature_first_active_logged: set[str] = set()
 
         self.data_iter = iter(self.dataloader)
         self.global_step = 0
@@ -412,6 +426,16 @@ class SigmaTrainer:
         self._last_policy: dict[str, float] = {}
         self._checkpoint_quarantine_count = 0
         self._checkpoint_resume_step = 0
+        self._last_checkpoint_path: str | None = None
+        self._last_checkpoint_time: str | None = None
+        self._last_log_feature_calls: dict[str, int] = {
+            "feature_sigma_rl": 0,
+            "feature_fractal_nas": 0,
+            "feature_uroboros": 0,
+            "feature_self_improver": 0,
+            "feature_hydra_v21": 0,
+        }
+        self._status_latest_path = self.output_dir / "status_latest.json"
         self._first_batch_wall: float | None = None
         self._first_step_wall: float | None = None
         self._startup_init_s = 0.0
@@ -554,6 +578,7 @@ class SigmaTrainer:
     def _save_checkpoint(self, step: int) -> None:
         replay_payload = [{"score": float(score), "seq": seq.clone().cpu()} for score, seq in list(self.replay)]
         checkpoint_model = getattr(self.model, "_orig_mod", self.model)
+        ckpt_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         payload = {
             "step": int(step),
             "model": checkpoint_model.state_dict(),
@@ -573,7 +598,7 @@ class SigmaTrainer:
             "causal_replay_state": self.causal_replay.state_dict(),
             "credit_state": self.credit_estimator.state_dict(),
             "last_replay_injected": bool(self._last_replay_injected),
-            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "time": ckpt_time,
         }
         if self.hydra_engine is not None:
             payload["hydra_state"] = self.hydra_engine.state_dict()
@@ -606,6 +631,8 @@ class SigmaTrainer:
         while len(checkpoints) > self.config.max_checkpoints:
             old = checkpoints.pop(0)
             old.unlink(missing_ok=True)
+        self._last_checkpoint_path = str(path)
+        self._last_checkpoint_time = ckpt_time
         print(f"[sigma-trainer] checkpoint saved: {path}")
     def _resume_if_available(self) -> int:
         candidates = self._checkpoint_candidates()
@@ -668,6 +695,9 @@ class SigmaTrainer:
                             self.replay.append((score, seq.cpu()))
                 step = int(payload["step"])
                 self._checkpoint_resume_step = step
+                if isinstance(payload.get("time"), str):
+                    self._last_checkpoint_time = str(payload.get("time"))
+                self._last_checkpoint_path = str(ckpt)
                 print(f"[sigma-trainer] resumed from {ckpt} step={step}")
                 return step
             except Exception as exc:
@@ -725,8 +755,35 @@ class SigmaTrainer:
         mult = max(1, int(self.config.startup_ttrl_interval_multiplier))
         return max(1, base * mult)
 
+    def _mark_feature_call(self, feature_name: str) -> None:
+        prev_calls = int(self.feature_calls.get(feature_name, 0))
+        next_calls = prev_calls + 1
+        self.feature_calls[feature_name] = next_calls
+        if prev_calls == 0 and next_calls > 0 and feature_name not in self._feature_first_active_logged:
+            print(f"[sigma-trainer] {feature_name} first active at step {self.global_step}")
+            self._feature_first_active_logged.add(feature_name)
+
     def _meta_features_ready(self) -> bool:
         return bool(self.global_step > int(self._meta_activation_step))
+
+    def _expected_first_meta_step(self, interval: int) -> int:
+        return int(self._meta_activation_step) + max(1, int(interval))
+
+    def _log_meta_activation_schedule(self) -> None:
+        ttrl_interval = self._effective_ttrl_interval()
+        expected_steps = {
+            "RL": self._expected_first_meta_step(ttrl_interval),
+            "Hydra": self._expected_first_meta_step(max(1, int(self.config.hydra_update_interval))),
+            "Fractal": self._expected_first_meta_step(max(1, int(self.config.fractal_interval_steps))),
+            "Uroboros": self._expected_first_meta_step(max(1, int(self.config.uroboros_interval))),
+            "Self-Improver": self._expected_first_meta_step(max(1, int(self.config.self_improver_interval))),
+        }
+        expected_str = ", ".join(f"{name}={step}" for name, step in expected_steps.items())
+        print(
+            "[sigma-trainer] meta schedule "
+            f"meta_activation_step={self._meta_activation_step} "
+            f"expected_first_eligible_steps({expected_str})"
+        )
 
     def _prepare_batch(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
@@ -766,7 +823,7 @@ class SigmaTrainer:
         if bool(self.config.c3o_credit_enabled) and hasattr(self.optimizer, "set_credit_signal"):
             try:
                 self.optimizer.set_credit_signal(float(self.credit_estimator.current_signal()))
-                self.feature_calls["feature_c3o_credit"] += 1
+                self._mark_feature_call("feature_c3o_credit")
             except Exception as exc:
                 raise RuntimeError(f"failed to set C3O credit signal: {exc}") from exc
         self.optimizer.zero_grad(set_to_none=True)
@@ -827,7 +884,7 @@ class SigmaTrainer:
             quality_score=float(novelty_quality),
         )
         self.replay.append((float(priority), seq.detach().cpu()))
-        self.feature_calls["feature_causal_replay"] += 1
+        self._mark_feature_call("feature_causal_replay")
 
     def _inject_replay(self, input_ids: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         self._last_replay_injected = False
@@ -870,13 +927,13 @@ class SigmaTrainer:
         if bool(self.config.verifier_cascade_enabled):
             parsed = parse_int_answer(text)
             if not parsed:
-                self.feature_calls["feature_verifier"] += 1
+                self._mark_feature_call("feature_verifier")
                 return 0.0, False
             if parsed == task.expected:
-                self.feature_calls["feature_verifier"] += 1
+                self._mark_feature_call("feature_verifier")
                 return 1.0, True
         result = verify_answer(task, text)
-        self.feature_calls["feature_verifier"] += 1
+        self._mark_feature_call("feature_verifier")
         return float(result.score), bool(result.passed)
 
     def _should_refine_candidate(self, *, rank_idx: int, shortlist_len: int) -> bool:
@@ -985,7 +1042,7 @@ class SigmaTrainer:
                 cfg=self.rl_cfg,
             )
 
-        self.feature_calls["feature_rl_auto_mix"] += 1
+        self._mark_feature_call("feature_rl_auto_mix")
         mix = self._compute_rl_mix_weights(rewards=rewards, diversity=diversity)
         losses: dict[str, torch.Tensor] = {}
         metrics: dict[str, float] = {}
@@ -1037,7 +1094,7 @@ class SigmaTrainer:
             )
             text = self._safe_decode(out[0].tolist())
             vr = verify_answer(task, text)
-            self.feature_calls["feature_verifier"] += 1
+            self._mark_feature_call("feature_verifier")
             passed += int(vr.passed)
         return float(passed / max(len(picked), 1))
 
@@ -1076,7 +1133,7 @@ class SigmaTrainer:
         refined_candidates = 0
         if asym_enabled:
             if bool(self.config.verifier_cascade_enabled):
-                self.feature_calls["feature_verifier_cascade"] += 1
+                self._mark_feature_call("feature_verifier_cascade")
             pool_mult = max(1.0, float(self.config.ttrl_candidate_pool_multiplier))
             pool_size = max(group_size, int(round(group_size * pool_mult)))
             draft_candidates: list[torch.Tensor] = []
@@ -1128,7 +1185,7 @@ class SigmaTrainer:
             rewards = [float(score) for _, score in chosen]
             asym_pool = float(pool_size)
             asym_verified = float(len(shortlisted))
-            self.feature_calls["feature_asym_verify"] += 1
+            self._mark_feature_call("feature_asym_verify")
         else:
             for _ in range(group_size):
                 seq, score = self._generate_one_with_refinement(prompt_tensor=prompt_tensor, task=task)
@@ -1191,7 +1248,7 @@ class SigmaTrainer:
             rl_loss_val, _ = self._optim_step(rl_loss)
             running_loss += float(rl_loss_val)
         rl_loss_val = running_loss / max(update_repeats, 1)
-        self.feature_calls["feature_sigma_rl"] += 1
+        self._mark_feature_call("feature_sigma_rl")
 
         reward_mean = float(raw_rewards_t.mean().item())
         reward_conf = float((raw_rewards_t > 0.5).float().mean().item())
@@ -1249,7 +1306,7 @@ class SigmaTrainer:
     def _apply_policy(self, policy: dict[str, float]) -> None:
         if not policy:
             return
-        self.feature_calls["feature_self_improver"] += 1
+        self._mark_feature_call("feature_self_improver")
         self._last_policy = dict(policy)
         lr_mul = float(policy.get("policy_lr_mul", 1.0))
         new_factor = self._lr_factor * lr_mul
@@ -1295,7 +1352,7 @@ class SigmaTrainer:
             apply_runtime=self._apply_runtime_snapshot,
         )
         if out:
-            self.feature_calls["feature_uroboros"] += 1
+            self._mark_feature_call("feature_uroboros")
         rw_metrics = self.reward_weights.to_metrics()
         for k, v in rw_metrics.items():
             out[k] = float(v)
@@ -1434,6 +1491,26 @@ class SigmaTrainer:
     def _log_metrics(self, metrics: dict[str, float]) -> None:
         with self.metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(metrics, ensure_ascii=True) + "\n")
+
+    def _write_status_latest(self, metrics: dict[str, float], bottleneck_stage: str) -> None:
+        status = {
+            "step": int(self.global_step),
+            "loss_ema": float(metrics.get("loss_ema", float("nan"))),
+            "effective_tokens_per_s": float(metrics.get("effective_tokens_per_s", float("nan"))),
+            "bottleneck_stage": str(bottleneck_stage),
+            "bottleneck_share": float(metrics.get("perf_bottleneck_share", float("nan"))),
+            "feature_sigma_rl_effective_calls": int(self.feature_calls["feature_sigma_rl"]),
+            "feature_fractal_nas_effective_calls": int(self.feature_calls["feature_fractal_nas"]),
+            "feature_uroboros_effective_calls": int(self.feature_calls["feature_uroboros"]),
+            "feature_self_improver_effective_calls": int(self.feature_calls["feature_self_improver"]),
+            "feature_hydra_v21_effective_calls": int(self.feature_calls["feature_hydra_v21"]),
+        }
+        if self._last_checkpoint_path:
+            status["last_checkpoint_path"] = self._last_checkpoint_path
+        if self._last_checkpoint_time:
+            status["last_checkpoint_time"] = self._last_checkpoint_time
+        with self._status_latest_path.open("w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=True, separators=(",", ":"))
 
     def _integrity_flags(self) -> dict[str, float]:
         c3o_effective = bool(self.config.c3o_credit_enabled and hasattr(self.optimizer, "set_credit_signal"))
@@ -1812,6 +1889,7 @@ class SigmaTrainer:
     def train(self) -> None:
         self._maybe_compile_model()
         torch.cuda.reset_peak_memory_stats(self.device)
+        self._log_meta_activation_schedule()
         self._log_metrics(
             {
                 "step": 0.0,
@@ -1857,8 +1935,8 @@ class SigmaTrainer:
                     phase_opt_s = max(time.perf_counter() - t_train_opt, 0.0)
                     phase_train_s = max(time.perf_counter() - t_phase, 0.0)
 
-                    self.feature_calls["feature_instant"] += 1
-                    self.feature_calls["feature_diff_mla"] += 1
+                    self._mark_feature_call("feature_instant")
+                    self._mark_feature_call("feature_diff_mla")
 
                     core_step_time = max(time.perf_counter() - start, 1e-6)
                     tokens_per_s = float(input_ids.numel() / core_step_time)
@@ -1908,7 +1986,7 @@ class SigmaTrainer:
                         hydra_metrics = self.hydra_engine.step(self.global_step)
                         phase_hydra_s = max(time.perf_counter() - t_phase, 0.0)
                         if hydra_metrics:
-                            self.feature_calls["feature_hydra_v21"] += 1
+                            self._mark_feature_call("feature_hydra_v21")
                         for k, v in hydra_metrics.items():
                             metrics[k] = float(v)
 
@@ -1939,7 +2017,7 @@ class SigmaTrainer:
                         )
                         phase_fractal_s = max(time.perf_counter() - t_phase, 0.0)
                     if fractal_metrics:
-                        self.feature_calls["feature_fractal_nas"] += 1
+                        self._mark_feature_call("feature_fractal_nas")
                     for k, v in fractal_metrics.items():
                         metrics[k] = float(v)
 
@@ -1960,7 +2038,7 @@ class SigmaTrainer:
                     )
                     phase_causal_s = max(time.perf_counter() - t_phase, 0.0)
                     if bool(self.config.causal_replay_enabled):
-                        self.feature_calls["feature_causal_replay"] += 1
+                        self._mark_feature_call("feature_causal_replay")
                     for k, v in causal_metrics.items():
                         metrics[k] = float(v)
                     t_phase = time.perf_counter()
@@ -2089,6 +2167,21 @@ class SigmaTrainer:
                     self._log_metrics(metrics)
 
                     if (self.global_step % max(1, self.config.log_interval)) == 0:
+                        meta_ready = self.global_step > int(self._meta_activation_step)
+                        ttrl_interval = max(1, int(self._effective_ttrl_interval()))
+                        meta_gated = not meta_ready
+                        key_features = (
+                            "feature_sigma_rl",
+                            "feature_fractal_nas",
+                            "feature_uroboros",
+                            "feature_self_improver",
+                            "feature_hydra_v21",
+                        )
+                        delta_calls = {
+                            key: int(self.feature_calls[key] - self._last_log_feature_calls.get(key, 0))
+                            for key in key_features
+                        }
+                        self._last_log_feature_calls = {key: int(self.feature_calls[key]) for key in key_features}
                         print(
                             f"step={self.global_step} "
                             f"loss={loss_val:.4f} "
@@ -2097,11 +2190,20 @@ class SigmaTrainer:
                             f"core_tps={metrics['core_tokens_per_s']:.2f} "
                             f"tps_ema={metrics['tokens_per_s_ema']:.2f} "
                             f"bnk_id={metrics['perf_bottleneck_stage_id']:.0f} "
+                            f"meta_ready={int(meta_ready)} "
+                            f"ttrl_int={ttrl_interval} "
+                            f"meta_gated={int(meta_gated)} "
+                            f"d_sigma={delta_calls['feature_sigma_rl']} "
+                            f"d_frac={delta_calls['feature_fractal_nas']} "
+                            f"d_uro={delta_calls['feature_uroboros']} "
+                            f"d_self={delta_calls['feature_self_improver']} "
+                            f"d_hydra={delta_calls['feature_hydra_v21']} "
                             f"gpu_util={metrics.get('gpu_util_percent', float('nan')):.1f}% "
                             f"gpu_mem={metrics['gpu_mem_alloc_gb']:.2f}GB "
                             f"hidden_eval={metrics.get('hidden_eval_pass', self._last_ttrl_hidden_pass):.3f} "
                             f"diff_lam={metrics.get('diff_attn_lambda_mean', 0.0):.3f}"
                         )
+                        self._write_status_latest(metrics=metrics, bottleneck_stage=bottleneck_stage)
 
                     if (self.global_step % max(1, self.config.save_interval)) == 0:
                         self._save_checkpoint(self.global_step)

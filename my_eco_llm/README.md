@@ -203,6 +203,16 @@ Familles de métriques:
   - Valeur effective par défaut du profil EXE: `64 + 8 = 72`
   - Objectif: éviter d'optimiser la boucle RL/NAS/uroboros sur les batches bootstrap synthétiques
 
+### Fenêtres d'activation attendues des features d'évolution
+
+| Evolution feature | Enabled flag | Gating condition | First expected activation window |
+|---|---|---|---|
+| Sigma RL (TTRL) | `feature_sigma_rl_enabled` | `global_step > meta_activation_step` and `global_step % effective_ttrl_interval == 0` | `meta_activation_step + effective_ttrl_interval` |
+| Hydra v2.1 | `feature_hydra_v21_enabled` | `hydra_enable` and `global_step > meta_activation_step`; updates paced by `hydra_update_interval` | `meta_activation_step + hydra_update_interval` |
+| Fractal NAS | `feature_fractal_nas_enabled` | `global_step > meta_activation_step`; cadence from `fractal_interval_steps` | `meta_activation_step + fractal_interval_steps` |
+| Uroboros | `feature_uroboros_enabled` | `uroboros_enabled` and `global_step > meta_activation_step`; cadence from `uroboros_interval` | `meta_activation_step + uroboros_interval` |
+| Self-Improver | `feature_self_improver_enabled` | `self_improver_enabled` and `global_step > meta_activation_step`; policy cadence from `self_improver_interval` | `meta_activation_step + self_improver_interval` |
+
 ## 11) Risques et modes d'échec à connaître
 
 - CUDA requis: `train_sigma.py` refuse `--device` non-CUDA
@@ -286,4 +296,9 @@ Ces volumes confirment que les features ne sont pas "peu utilisees" sur un run n
 - Commande: `eco_train.exe @train_sigma_args.txt`
 - Observation en 10 min: progression reelle jusqu'au `step=39` dans `runs/sigma_main/metrics.jsonl`, avec `feature_c3o_credit_enabled=1` et `feature_c3o_credit_effective_calls=39`.
 
+## 15) Where files are written
+
+Les chemins relatifs (`--output-dir`, `--checkpoint-dir`, `metrics_file`) sont résolus depuis le dossier de lancement (`Path.cwd()`), pas depuis l'emplacement de l'exécutable.
+
+Exemple concret: si `eco_train.exe` est dans `D:\Sigma\bin` mais que vous lancez la commande depuis `D:\runs\exp42` avec `--checkpoint-dir checkpoints`, alors les checkpoints seront écrits dans `D:\runs\exp42\checkpoints`.
 
