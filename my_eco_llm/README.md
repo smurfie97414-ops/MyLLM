@@ -163,6 +163,22 @@ Même logique pour certains chemins (`output-dir` Python vs args EXE): la vérit
 
 Contenu: exception, trace, métriques récentes, état des features.
 
+## Inference Sigma depuis checkpoint
+
+Script ajouté: `infer_sigma.py`
+
+Commande minimale pour inférer sur le checkpoint le plus récent:
+
+```bat
+python my_eco_llm/infer_sigma.py --config my_eco_llm/sigma_config.json --prompt "Bonjour" --tokenizer-backend tiktoken --tokenizer-name cl100k_base
+```
+
+Notes importantes:
+
+- Le script charge les poids modèle depuis `payload["model"]` dans `checkpoint_step_*.pt`.
+- Le fichier `--config` doit être compatible `SigmaConfig` (mêmes hyperparamètres structurants que l'entraînement: `d_model`, `n_layers`, `n_heads`, etc.).
+- Un mismatch entre config et checkpoint (shapes ou clés) provoque un échec de `load_state_dict`.
+
 ## 9) Métriques et preuves d'activation
 
 Sortie centrale:
