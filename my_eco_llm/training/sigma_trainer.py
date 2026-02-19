@@ -425,6 +425,16 @@ class SigmaTrainer:
         self._last_policy: dict[str, float] = {}
         self._checkpoint_quarantine_count = 0
         self._checkpoint_resume_step = 0
+        self._last_checkpoint_path: str | None = None
+        self._last_checkpoint_time: str | None = None
+        self._last_log_feature_calls: dict[str, int] = {
+            "feature_sigma_rl": 0,
+            "feature_fractal_nas": 0,
+            "feature_uroboros": 0,
+            "feature_self_improver": 0,
+            "feature_hydra_v21": 0,
+        }
+        self._status_latest_path = self.output_dir / "status_latest.json"
         self._first_batch_wall: float | None = None
         self._first_step_wall: float | None = None
         self._startup_init_s = 0.0
@@ -567,6 +577,7 @@ class SigmaTrainer:
     def _save_checkpoint(self, step: int) -> None:
         replay_payload = [{"score": float(score), "seq": seq.clone().cpu()} for score, seq in list(self.replay)]
         checkpoint_model = getattr(self.model, "_orig_mod", self.model)
+        ckpt_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         payload = {
             "step": int(step),
             "model": checkpoint_model.state_dict(),
@@ -586,7 +597,7 @@ class SigmaTrainer:
             "causal_replay_state": self.causal_replay.state_dict(),
             "credit_state": self.credit_estimator.state_dict(),
             "last_replay_injected": bool(self._last_replay_injected),
-            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "time": ckpt_time,
         }
         if self.hydra_engine is not None:
             payload["hydra_state"] = self.hydra_engine.state_dict()
@@ -619,6 +630,8 @@ class SigmaTrainer:
         while len(checkpoints) > self.config.max_checkpoints:
             old = checkpoints.pop(0)
             old.unlink(missing_ok=True)
+        self._last_checkpoint_path = str(path)
+        self._last_checkpoint_time = ckpt_time
         print(f"[sigma-trainer] checkpoint saved: {path}")
     def _resume_if_available(self) -> int:
         candidates = self._checkpoint_candidates()
@@ -681,6 +694,9 @@ class SigmaTrainer:
                             self.replay.append((score, seq.cpu()))
                 step = int(payload["step"])
                 self._checkpoint_resume_step = step
+                if isinstance(payload.get("time"), str):
+                    self._last_checkpoint_time = str(payload.get("time"))
+                self._last_checkpoint_path = str(ckpt)
                 print(f"[sigma-trainer] resumed from {ckpt} step={step}")
                 return step
             except Exception as exc:
@@ -1448,6 +1464,26 @@ class SigmaTrainer:
         with self.metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(metrics, ensure_ascii=True) + "\n")
 
+    def _write_status_latest(self, metrics: dict[str, float], bottleneck_stage: str) -> None:
+        status = {
+            "step": int(self.global_step),
+            "loss_ema": float(metrics.get("loss_ema", float("nan"))),
+            "effective_tokens_per_s": float(metrics.get("effective_tokens_per_s", float("nan"))),
+            "bottleneck_stage": str(bottleneck_stage),
+            "bottleneck_share": float(metrics.get("perf_bottleneck_share", float("nan"))),
+            "feature_sigma_rl_effective_calls": int(self.feature_calls["feature_sigma_rl"]),
+            "feature_fractal_nas_effective_calls": int(self.feature_calls["feature_fractal_nas"]),
+            "feature_uroboros_effective_calls": int(self.feature_calls["feature_uroboros"]),
+            "feature_self_improver_effective_calls": int(self.feature_calls["feature_self_improver"]),
+            "feature_hydra_v21_effective_calls": int(self.feature_calls["feature_hydra_v21"]),
+        }
+        if self._last_checkpoint_path:
+            status["last_checkpoint_path"] = self._last_checkpoint_path
+        if self._last_checkpoint_time:
+            status["last_checkpoint_time"] = self._last_checkpoint_time
+        with self._status_latest_path.open("w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=True, separators=(",", ":"))
+
     def _integrity_flags(self) -> dict[str, float]:
         c3o_effective = bool(self.config.c3o_credit_enabled and hasattr(self.optimizer, "set_credit_signal"))
         return {
@@ -2102,6 +2138,21 @@ class SigmaTrainer:
                     self._log_metrics(metrics)
 
                     if (self.global_step % max(1, self.config.log_interval)) == 0:
+                        meta_ready = self.global_step > int(self._meta_activation_step)
+                        ttrl_interval = max(1, int(self._effective_ttrl_interval()))
+                        meta_gated = not meta_ready
+                        key_features = (
+                            "feature_sigma_rl",
+                            "feature_fractal_nas",
+                            "feature_uroboros",
+                            "feature_self_improver",
+                            "feature_hydra_v21",
+                        )
+                        delta_calls = {
+                            key: int(self.feature_calls[key] - self._last_log_feature_calls.get(key, 0))
+                            for key in key_features
+                        }
+                        self._last_log_feature_calls = {key: int(self.feature_calls[key]) for key in key_features}
                         print(
                             f"step={self.global_step} "
                             f"loss={loss_val:.4f} "
@@ -2110,11 +2161,20 @@ class SigmaTrainer:
                             f"core_tps={metrics['core_tokens_per_s']:.2f} "
                             f"tps_ema={metrics['tokens_per_s_ema']:.2f} "
                             f"bnk_id={metrics['perf_bottleneck_stage_id']:.0f} "
+                            f"meta_ready={int(meta_ready)} "
+                            f"ttrl_int={ttrl_interval} "
+                            f"meta_gated={int(meta_gated)} "
+                            f"d_sigma={delta_calls['feature_sigma_rl']} "
+                            f"d_frac={delta_calls['feature_fractal_nas']} "
+                            f"d_uro={delta_calls['feature_uroboros']} "
+                            f"d_self={delta_calls['feature_self_improver']} "
+                            f"d_hydra={delta_calls['feature_hydra_v21']} "
                             f"gpu_util={metrics.get('gpu_util_percent', float('nan')):.1f}% "
                             f"gpu_mem={metrics['gpu_mem_alloc_gb']:.2f}GB "
                             f"hidden_eval={metrics.get('hidden_eval_pass', self._last_ttrl_hidden_pass):.3f} "
                             f"diff_lam={metrics.get('diff_attn_lambda_mean', 0.0):.3f}"
                         )
+                        self._write_status_latest(metrics=metrics, bottleneck_stage=bottleneck_stage)
 
                     if (self.global_step % max(1, self.config.save_interval)) == 0:
                         self._save_checkpoint(self.global_step)
