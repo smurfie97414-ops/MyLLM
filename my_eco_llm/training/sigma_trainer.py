@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import random
+import sys
 import threading
 import time
 import traceback
@@ -237,16 +238,28 @@ class SigmaTrainer:
         self.device = torch.device(config.device)
         self.rng = random.Random(20260216)
 
-        self.output_dir = Path(config.output_dir)
+        self.output_dir = Path(config.output_dir).expanduser().resolve(strict=False)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.metrics_path = self.output_dir / config.metrics_file
+        self.metrics_path = (self.output_dir / config.metrics_file).resolve(strict=False)
         perf_dir_name = config.perf_report_dir.strip() if config.perf_report_dir else ""
         self.perf_dir = Path(perf_dir_name) if perf_dir_name else (self.output_dir / "perf")
         self.perf_dir.mkdir(parents=True, exist_ok=True)
-        self.checkpoint_dir = Path(config.checkpoint_dir)
-        if not self.checkpoint_dir.is_absolute():
-            self.checkpoint_dir = Path.cwd() / self.checkpoint_dir
+        checkpoint_path = Path(config.checkpoint_dir).expanduser()
+        checkpoint_is_relative = not checkpoint_path.is_absolute()
+        if checkpoint_is_relative:
+            executable_dir = Path(sys.argv[0]).expanduser().resolve(strict=False).parent
+            current_dir = Path.cwd().resolve(strict=False)
+            if current_dir != executable_dir:
+                print(
+                    "[startup-warning] checkpoint_dir is relative and resolves from current working directory "
+                    f"({current_dir}) instead of executable directory ({executable_dir})."
+                )
+            checkpoint_path = current_dir / checkpoint_path
+        self.checkpoint_dir = checkpoint_path.resolve(strict=False)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[startup-paths] output_dir={self.output_dir}")
+        print(f"[startup-paths] checkpoint_dir={self.checkpoint_dir}")
+        print(f"[startup-paths] metrics_file={self.metrics_path}")
 
         self.model.to(self.device)
         self.model.train()
